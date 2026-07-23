@@ -20,7 +20,7 @@ import mlx.core as mx
 from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
 
-STRIDE = 10
+STRIDE = 5
 
 
 def parse_bits(s: str) -> list[int]:
@@ -29,7 +29,9 @@ def parse_bits(s: str) -> list[int]:
 
 def char_bit(ch: str) -> int:
     """The bit a character encodes: LSB of its codepoint (even -> 0, odd -> 1)."""
-    return ord(ch) & 1
+    chars_1 = {'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'}
+    return ch.lower() in chars_1
+    #return ord(ch) & 1
 
 
 def letter_bits(text: str) -> list[int]:
@@ -131,7 +133,7 @@ def main() -> None:
 
     model, tokenizer = load(args.model)
     #messages = [{"role": "user", "content": f"Write a few sentences about: {args.topic}"}]
-    messages = [{"role": "user", "content": f"Please write a post-modern high literarture short story about an orange cat breaking up with a blonde haired boy ninja."}]
+    messages = [{"role": "user", "content": f"Please write a post-modern high literarture short story about an orange boy cat breaking up with a blonde haired boy ninja."}]
     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
     text = generate(
