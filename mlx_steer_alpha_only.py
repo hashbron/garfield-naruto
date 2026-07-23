@@ -105,6 +105,7 @@ class Stego:
         self.skip_penalty = skip_penalty
         self.offset = None      # len of `tokens` before generation starts
         self.tables = None      # built lazily once the vocab size is known
+        self.last_m0 = None     # letters until the next constrained slot (-1 = bits spent)
 
     def _build_tables(self, V: int):
         print(f"[stego] indexing {V} tokens (one-time)...")
@@ -130,7 +131,9 @@ class Stego:
         # bits consumed so far = non-skip letters already sitting on constrained slots
         consumed = sum(char_bucket(letters[j]) != SKIP for j in range(0, nl, STRIDE))
         if consumed >= len(self.bits):
+            self.last_m0 = -1
             return logits                        # bitstream spent -> free
+        self.last_m0 = m0                        # 0 == the next letter carries a bit
         b = self.bits[consumed]
 
         vec = np.array(logits.astype(mx.float32)).reshape(-1)
@@ -188,8 +191,9 @@ def _logsumexp(v: np.ndarray) -> float:
     return m + float(np.log(np.exp(v - m).sum()))
 
 
-def _sample_logits(logits: np.ndarray, temp: float, rng) -> int:
-    """Sample an index from `logits` (may contain -inf) at temperature `temp`."""
+def _sample_logits(logits: np.ndarray, temp: float, rng, top_p: float = 1.0) -> int:
+    """Sample an index from `logits` (may contain -inf) at temperature `temp`,
+    optionally restricted to the top-`top_p` nucleus."""
     if temp <= 1e-6:
         return int(np.argmax(logits))
     z = logits / temp
@@ -199,34 +203,78 @@ def _sample_logits(logits: np.ndarray, temp: float, rng) -> int:
     s = p.sum()
     if s <= 0:
         return int(np.argmax(logits))
-    return int(rng.choice(p.size, p=p / s))
+    p = p / s
+    if top_p < 1.0:
+        order = np.argsort(p)[::-1]
+        cut = int(np.searchsorted(np.cumsum(p[order]), top_p)) + 1
+        keep = np.zeros_like(p, dtype=bool)
+        keep[order[:cut]] = True
+        p = np.where(keep, p, 0.0)
+        p /= p.sum()
+    return int(rng.choice(p.size, p=p))
+
+
+def _antirepeat(vec: np.ndarray, gen_ids: list[int], *, freq_penalty: float,
+                window: int, no_repeat_ngram: int) -> np.ndarray:
+    """Discourage degenerate repetition, in place on `vec` (only finite entries):
+
+      * freq_penalty: subtract `freq_penalty` per recent occurrence of a token
+        (within the last `window` tokens) — dampens over-used tokens.
+      * no_repeat_ngram: strongly demote any token that would repeat an n-gram
+        already seen — kills phrase loops ('word word word') without punishing
+        ordinary reuse of common words the way a raw frequency penalty does.
+    """
+    if freq_penalty > 0 and gen_ids:
+        from collections import Counter
+        for t, ct in Counter(gen_ids[-window:]).items():
+            if np.isfinite(vec[t]):
+                vec[t] -= freq_penalty * ct
+    n = no_repeat_ngram
+    if n and n >= 1 and len(gen_ids) >= n - 1:
+        prefix = tuple(gen_ids[-(n - 1):]) if n > 1 else ()
+        for i in range(len(gen_ids) - n + 1):
+            if tuple(gen_ids[i:i + n - 1]) == prefix:
+                t = gen_ids[i + n - 1]
+                if np.isfinite(vec[t]):
+                    vec[t] -= 20.0        # ~e^20: effectively blocked, but never -inf
+    return vec
 
 
 def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=500,
                    temperature=0.8, skip_penalty=SKIP_PENALTY, num_candidates=5,
-                   lookahead_weight=1.0, seed=0, verbose=False) -> str:
-    """Constrained decoding with one-step *lookahead rescoring*.
+                   lookahead_weight=1.0, lookahead_floor=0.05, top_p=0.95,
+                   freq_penalty=0.5, rep_window=64, no_repeat_ngram=3,
+                   seed=0, verbose=False) -> str:
+    """Constrained decoding with anti-repetition sampling + lookahead corner-avoidance.
 
-    At each position the Stego constraint yields a set of tokens that all fit the
-    pattern (correct-bucket letters, penalized skips/fillers; wrong-bit letters
-    are already at -inf). Rather than sample from that set blindly, we shortlist
-    the top `num_candidates`, trial-run each one token forward, and rate it by how
-    much probability the model still places on a *pattern-valid* continuation
-    afterwards — its fluency, and how un-cornered the next constrained slot is.
-    Each candidate's own constrained logit is combined with that lookahead score,
-    and we sample from the combined scores at `temperature`.
+    Every step: apply the Stego constraint (wrong-bit letters -> -inf), then an
+    anti-repetition penalty, then sample the full top-`top_p` nucleus at
+    `temperature`. Sampling the *full* constrained distribution is what keeps the
+    text fluent — we do NOT restrict to a shortlist off-slot.
 
-    Cost: ~(num_candidates + 1) forward passes per generated token. Lookahead is
-    skipped automatically once the bitstream is fully encoded (no constraint left)
-    and whenever only one candidate is in play.
+    Only at a constrained slot (the letter that actually carries a bit, m0 == 0)
+    do we optionally rescore: trial-run the top `num_candidates` valid letters one
+    token forward and penalize any that would corner the *next* constrained slot,
+    i.e. leave it under `lookahead_floor` of the model's mass on a valid token.
+    Above the floor a candidate gets no bonus, so variety stays with the natural
+    distribution rather than being pulled toward high model certainty (repetition).
+
+    Cost: one forward pass per token, plus `num_candidates` extra only on the ~1
+    in STRIDE steps that carry a bit (and none once the bitstream is spent).
     """
     from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+    try:
+        from mlx_lm.models.cache import can_trim_prompt_cache
+    except ImportError:
+        def can_trim_prompt_cache(_cache):     # older mlx_lm: assume trimmable
+            return True
 
     stego = Stego(tokenizer, bits, skip_penalty=skip_penalty)
     rng = np.random.default_rng(seed)
     eos_ids = set(getattr(tokenizer, "eos_token_ids", None) or
                   ([tokenizer.eos_token_id]
                    if getattr(tokenizer, "eos_token_id", None) is not None else []))
+    log_floor = float(np.log(lookahead_floor)) if lookahead_floor > 0 else -np.inf
 
     tokens = list(prompt)
     cache = make_prompt_cache(model)
@@ -234,29 +282,34 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=500,
     mx.eval(logits)
     stego.offset = len(prompt)      # generated tokens = everything after the prompt
 
-    for _ in range(max_tokens):
-        raw = _vec(logits)
-        base = _masked_vector(stego, tokens, logits)   # constrained current-step logits
-        constrained = not np.array_equal(base, raw)    # False once the bitstream is spent
+    use_lookahead = lookahead_weight > 0.0 and num_candidates > 1
+    if use_lookahead and not can_trim_prompt_cache(cache):
+        print("[stego] cache is not trimmable; lookahead disabled")
+        use_lookahead = False
 
-        if not constrained or lookahead_weight == 0.0 or num_candidates <= 1:
-            choice = _sample_logits(base, temperature, rng)
-        else:
+    for _ in range(max_tokens):
+        masked = _masked_vector(stego, tokens, logits)    # constraint applied (sets last_m0)
+        base = _antirepeat(masked.copy(), tokens[len(prompt):], freq_penalty=freq_penalty,
+                           window=rep_window, no_repeat_ngram=no_repeat_ngram)
+
+        if use_lookahead and stego.last_m0 == 0:          # only at a bit-carrying slot
             valid = np.where(np.isfinite(base))[0]
             k = min(num_candidates, valid.size)
-            cand = valid[np.argsort(base[valid])[-k:]]     # highest-logit valid tokens
-            combined = np.full(k, -np.inf)
+            cand = valid[np.argsort(base[valid])[-k:]]    # highest-logit valid letters
+            combined = np.empty(k)
             for j, c in enumerate(cand):
                 c = int(c)
                 nlogits = model(mx.array([[c]]), cache=cache)[:, -1, :]
                 mx.eval(nlogits)
-                nraw = _vec(nlogits)
-                nmasked = _masked_vector(stego, tokens + [c], nlogits)
-                # log P(model's own next token also fits the pattern): 0 == uncornered
-                look = _logsumexp(nmasked) - _logsumexp(nraw)
+                # log-fraction of the model's mass left on pattern-valid next
+                # tokens; floored so only genuinely cornered candidates lose out.
+                look = min(0.0, (_logsumexp(_masked_vector(stego, tokens + [c], nlogits))
+                                 - _logsumexp(_vec(nlogits))) - log_floor)
                 combined[j] = base[c] + lookahead_weight * look
-                trim_prompt_cache(cache, 1)                # undo the trial token
-            choice = int(cand[_sample_logits(combined, temperature, rng)])
+                trim_prompt_cache(cache, 1)               # undo the trial token
+            choice = int(cand[_sample_logits(combined, temperature, rng, top_p)])
+        else:
+            choice = _sample_logits(base, temperature, rng, top_p)
 
         tokens.append(choice)
         if choice in eos_ids:
@@ -312,7 +365,16 @@ def main() -> None:
     ap.add_argument("--candidates", type=int, default=5,
                     help="pattern-valid tokens to trial-run per step (1 disables lookahead)")
     ap.add_argument("--lookahead-weight", type=float, default=1.0,
-                    help="weight of the lookahead fluency score vs the current logit (0 disables)")
+                    help="weight of the lookahead corner-avoidance score (0 disables)")
+    ap.add_argument("--lookahead-floor", type=float, default=0.05,
+                    help="only penalize a candidate if it leaves <this fraction of model mass valid")
+    ap.add_argument("--top-p", type=float, default=0.95, help="nucleus sampling cutoff")
+    ap.add_argument("--freq-penalty", type=float, default=0.5,
+                    help="logit penalty per recent occurrence of a token (anti-repetition)")
+    ap.add_argument("--rep-window", type=int, default=64,
+                    help="how many recent tokens the frequency penalty looks back over")
+    ap.add_argument("--no-repeat-ngram", type=int, default=3,
+                    help="block repeating any n-gram of this size (0 disables)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -333,6 +395,11 @@ def main() -> None:
         skip_penalty=args.skip_penalty,
         num_candidates=args.candidates,
         lookahead_weight=args.lookahead_weight,
+        lookahead_floor=args.lookahead_floor,
+        top_p=args.top_p,
+        freq_penalty=args.freq_penalty,
+        rep_window=args.rep_window,
+        no_repeat_ngram=args.no_repeat_ngram,
         seed=args.seed,
         verbose=args.verbose,
     )
