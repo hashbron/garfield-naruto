@@ -32,8 +32,7 @@ import unicodedata
 
 import numpy as np
 import mlx.core as mx
-from mlx_lm import load, generate
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm import load
 
 STRIDE = 5
 SKIP = 2                # index of the third (bit-less) bucket
@@ -139,10 +138,16 @@ class Stego:
         #   == b       -> encodes the wanted bit          (allowed, unchanged)
         #   == 1 - b   -> encodes the wrong bit           (forbidden)
         #   == SKIP    -> carries no bit                  (allowed, penalized)
-        #   == -1      -> token too short to reach it     (free)
+        #   == -1      -> token places no letter here     (see below)
         col = buckets[:, m0]
         vec[(col != -1) & (col != b) & (col != SKIP)] = -np.inf
         vec[col == SKIP] -= self.skip_penalty
+        # When the constrained letter is imminent (m0 == 0), a letter-free token
+        # (col == -1: '*', whitespace, punctuation, EOS) would defer the bit at
+        # zero cost and can loop forever ('****...'). Penalize it exactly like a
+        # skip so encoding stays the cheapest move, without forbidding filler.
+        if m0 == 0:
+            vec[col == -1] -= self.skip_penalty
         # Tokens with more than STRIDE letters can reach further constrained slots;
         # simulate each so a wrong bit anywhere in the token is forbidden. Skips
         # inside the token defer the bit index rather than consuming it.
@@ -163,6 +168,107 @@ class Stego:
         if np.isneginf(vec).all():
             return logits                        # never mask everything
         return mx.array(vec.reshape(1, -1))
+
+
+def _vec(logits) -> np.ndarray:
+    """An mx/np logits row -> a flat float32 numpy vector."""
+    return np.array(logits.astype(mx.float32)).reshape(-1)
+
+
+def _masked_vector(stego: "Stego", tokens: list[int], logits) -> np.ndarray:
+    """Current-step logits after the Stego constraint, as a numpy vector."""
+    return _vec(stego(mx.array(tokens), logits))
+
+
+def _logsumexp(v: np.ndarray) -> float:
+    finite = v[np.isfinite(v)]
+    if finite.size == 0:
+        return -np.inf
+    m = float(finite.max())
+    return m + float(np.log(np.exp(v - m).sum()))
+
+
+def _sample_logits(logits: np.ndarray, temp: float, rng) -> int:
+    """Sample an index from `logits` (may contain -inf) at temperature `temp`."""
+    if temp <= 1e-6:
+        return int(np.argmax(logits))
+    z = logits / temp
+    z = z - _logsumexp(z)
+    p = np.exp(z)
+    p[~np.isfinite(logits)] = 0.0
+    s = p.sum()
+    if s <= 0:
+        return int(np.argmax(logits))
+    return int(rng.choice(p.size, p=p / s))
+
+
+def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=500,
+                   temperature=0.8, skip_penalty=SKIP_PENALTY, num_candidates=5,
+                   lookahead_weight=1.0, seed=0, verbose=False) -> str:
+    """Constrained decoding with one-step *lookahead rescoring*.
+
+    At each position the Stego constraint yields a set of tokens that all fit the
+    pattern (correct-bucket letters, penalized skips/fillers; wrong-bit letters
+    are already at -inf). Rather than sample from that set blindly, we shortlist
+    the top `num_candidates`, trial-run each one token forward, and rate it by how
+    much probability the model still places on a *pattern-valid* continuation
+    afterwards — its fluency, and how un-cornered the next constrained slot is.
+    Each candidate's own constrained logit is combined with that lookahead score,
+    and we sample from the combined scores at `temperature`.
+
+    Cost: ~(num_candidates + 1) forward passes per generated token. Lookahead is
+    skipped automatically once the bitstream is fully encoded (no constraint left)
+    and whenever only one candidate is in play.
+    """
+    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+
+    stego = Stego(tokenizer, bits, skip_penalty=skip_penalty)
+    rng = np.random.default_rng(seed)
+    eos_ids = set(getattr(tokenizer, "eos_token_ids", None) or
+                  ([tokenizer.eos_token_id]
+                   if getattr(tokenizer, "eos_token_id", None) is not None else []))
+
+    tokens = list(prompt)
+    cache = make_prompt_cache(model)
+    logits = model(mx.array(prompt)[None], cache=cache)[:, -1, :]
+    mx.eval(logits)
+    stego.offset = len(prompt)      # generated tokens = everything after the prompt
+
+    for _ in range(max_tokens):
+        raw = _vec(logits)
+        base = _masked_vector(stego, tokens, logits)   # constrained current-step logits
+        constrained = not np.array_equal(base, raw)    # False once the bitstream is spent
+
+        if not constrained or lookahead_weight == 0.0 or num_candidates <= 1:
+            choice = _sample_logits(base, temperature, rng)
+        else:
+            valid = np.where(np.isfinite(base))[0]
+            k = min(num_candidates, valid.size)
+            cand = valid[np.argsort(base[valid])[-k:]]     # highest-logit valid tokens
+            combined = np.full(k, -np.inf)
+            for j, c in enumerate(cand):
+                c = int(c)
+                nlogits = model(mx.array([[c]]), cache=cache)[:, -1, :]
+                mx.eval(nlogits)
+                nraw = _vec(nlogits)
+                nmasked = _masked_vector(stego, tokens + [c], nlogits)
+                # log P(model's own next token also fits the pattern): 0 == uncornered
+                look = _logsumexp(nmasked) - _logsumexp(nraw)
+                combined[j] = base[c] + lookahead_weight * look
+                trim_prompt_cache(cache, 1)                # undo the trial token
+            choice = int(cand[_sample_logits(combined, temperature, rng)])
+
+        tokens.append(choice)
+        if choice in eos_ids:
+            break
+        logits = model(mx.array([[choice]]), cache=cache)[:, -1, :]
+        mx.eval(logits)
+        if verbose:
+            print(tokenizer.decode([choice]), end="", flush=True)
+
+    if verbose:
+        print()
+    return tokenizer.decode(tokens[len(prompt):])
 
 
 def verify(text: str, bits: list[int]) -> bool:
@@ -203,6 +309,11 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--skip-penalty", type=float, default=SKIP_PENALTY,
                     help="logit penalty for placing a skip letter on a slot")
+    ap.add_argument("--candidates", type=int, default=5,
+                    help="pattern-valid tokens to trial-run per step (1 disables lookahead)")
+    ap.add_argument("--lookahead-weight", type=float, default=1.0,
+                    help="weight of the lookahead fluency score vs the current logit (0 disables)")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -215,11 +326,14 @@ def main() -> None:
     messages = [{"role": "user", "content": f"Please write a post-modern high literarture short story about an orange boy cat breaking up with a blonde haired boy ninja."}]
     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
-    text = generate(
-        model, tokenizer, prompt,
+    text = steer_generate(
+        model, tokenizer, prompt, bits,
         max_tokens=args.max_tokens,
-        sampler=make_sampler(temp=args.temperature),
-        logits_processors=[Stego(tokenizer, bits, skip_penalty=args.skip_penalty)],
+        temperature=args.temperature,
+        skip_penalty=args.skip_penalty,
+        num_candidates=args.candidates,
+        lookahead_weight=args.lookahead_weight,
+        seed=args.seed,
         verbose=args.verbose,
     )
 
