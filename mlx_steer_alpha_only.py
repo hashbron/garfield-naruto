@@ -28,6 +28,7 @@ unnatural. A skip is never *incorrect*; it only defers the bit.
 from __future__ import annotations
 
 import argparse
+import unicodedata
 
 import numpy as np
 import mlx.core as mx
@@ -70,8 +71,18 @@ _BUCKET = _make_buckets(_FREQ)
 
 
 def char_bucket(ch: str) -> int:
-    """Which bucket a letter falls in: 0 or 1 encode that bit, SKIP carries none."""
-    return _BUCKET[ch.lower()]
+    """Which bucket a letter falls in: 0 or 1 encode that bit, SKIP carries none.
+
+    Totally defined over any `.isalpha()` character: accented letters are folded
+    to their base (é -> e, ñ -> n); letters with no a-z base (non-Latin scripts)
+    fall into SKIP so they carry no bit and can never be the wrong bit."""
+    c = ch.lower()
+    if c in _BUCKET:
+        return _BUCKET[c]
+    for base in unicodedata.normalize("NFKD", c):
+        if base in _BUCKET:
+            return _BUCKET[base]
+    return SKIP
 
 
 def letter_buckets(text: str) -> list[int]:
