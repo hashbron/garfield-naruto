@@ -2,24 +2,24 @@
 """
 mlx_steer_alpha_only.py — steganographic encoding on Apple Silicon (MLX).
 
-Generate text about a topic while hiding a bitstream in every 5th LETTER.
-The alphabet is split into three buckets of (near) equal probability in natural
-text:
+Generate text about a topic while hiding a bitstream in every STRIDE-th CHARACTER
+(strict character positions — spaces and punctuation count too). Characters split
+into three buckets:
 
     bucket 0 -> encodes bit 0
     bucket 1 -> encodes bit 1
-    bucket 2 -> SKIP: carries no bit at all
+    bucket 2 -> SKIP: carries no bit (all non-letters + some letters)
 
-At each constrained letter position (letter index j with j % 5 == 0):
+At each constrained character position (char index j with j % STRIDE == 0):
 
-  * a letter from the *wrong* bit-bucket is forbidden (probability 0),
-  * a letter from the *correct* bit-bucket encodes the next bit,
-  * a SKIP letter is *penalized but still allowed* — it consumes no bit, so the
-    decoder just moves on to the next constrained letter.
+  * a character from the *wrong* bit-bucket is forbidden (probability 0),
+  * a character from the *correct* bit-bucket encodes the next bit,
+  * a SKIP character (space, comma, period, or a skip-bucket letter) is
+    *penalized but still allowed* — it consumes no bit, so the decoder moves on.
 
-The penalty biases generation toward actually encoding, while letting a
-high-probability skip letter win when every correct-bucket alternative is
-unnatural. A skip is never *incorrect*; it only defers the bit.
+The penalty biases generation toward actually encoding, while letting the model
+spend a constrained slot on a space or period when it needs a word break rather
+than forcing a letter. A skip is never *incorrect*; it only defers the bit.
 
     pip install mlx-lm
     python mlx_steer_alpha_only.py --topic "the sea" --bits 10110
@@ -36,7 +36,7 @@ from mlx_lm import load
 
 STRIDE = 5
 SKIP = 2                # index of the third (bit-less) bucket
-SKIP_PENALTY = 4.0      # logit penalty for placing a skip letter on a slot
+SKIP_PENALTY = 4.0      # logit penalty for placing a skip character on a slot
 
 
 def parse_bits(s: str) -> list[int]:
@@ -70,11 +70,13 @@ _BUCKET = _make_buckets(_FREQ)
 
 
 def char_bucket(ch: str) -> int:
-    """Which bucket a letter falls in: 0 or 1 encode that bit, SKIP carries none.
+    """Which bucket a character falls in: 0 or 1 encode that bit, SKIP carries none.
 
-    Totally defined over any `.isalpha()` character: accented letters are folded
-    to their base (é -> e, ñ -> n); letters with no a-z base (non-Latin scripts)
-    fall into SKIP so they carry no bit and can never be the wrong bit."""
+    Totally defined over ANY character. Letters a-z map to their frequency bucket;
+    accented letters fold to their base (é -> e, ñ -> n); everything else — spaces,
+    punctuation, digits, non-Latin scripts — falls into SKIP, so it carries no bit
+    and can never be the wrong bit. This is what lets the model insert word breaks
+    and punctuation freely at constrained positions."""
     c = ch.lower()
     if c in _BUCKET:
         return _BUCKET[c]
@@ -84,20 +86,21 @@ def char_bucket(ch: str) -> int:
     return SKIP
 
 
-def letter_buckets(text: str) -> list[int]:
-    """Bucket of each letter in `text`, in order (non-letters skipped)."""
-    return [char_bucket(c) for c in text if c.isalpha()]
+def char_buckets(text: str) -> list[int]:
+    """Bucket of each character in `text`, in order. Strict character positions:
+    non-letters (spaces, punctuation) are included and fall in SKIP."""
+    return [char_bucket(c) for c in text]
 
 
 def extract(text: str) -> list[int]:
-    """Recover the hidden bitstream: read every STRIDE-th letter, dropping skips."""
-    return [b for b in letter_buckets(text)[::STRIDE] if b != SKIP]
+    """Recover the hidden bitstream: read every STRIDE-th character, dropping skips."""
+    return [b for b in char_buckets(text)[::STRIDE] if b != SKIP]
 
 
 class Stego:
-    """MLX logits processor. Forbids any token that would place a wrong-bit letter
-    on a constrained slot, and penalizes (but permits) tokens that place a skip
-    letter there — biasing toward encoding while allowing natural skips."""
+    """MLX logits processor. Forbids any token that would place a wrong-bit
+    character on a constrained slot, and penalizes (but permits) tokens that place
+    a skip character there — biasing toward encoding while allowing natural skips."""
 
     def __init__(self, tok, bits: list[int], skip_penalty: float = SKIP_PENALTY):
         self.tok = tok
@@ -105,13 +108,13 @@ class Stego:
         self.skip_penalty = skip_penalty
         self.offset = None      # len of `tokens` before generation starts
         self.tables = None      # built lazily once the vocab size is known
-        self.last_m0 = None     # letters until the next constrained slot (-1 = bits spent)
+        self.last_m0 = None     # chars until the next constrained slot (-1 = bits spent)
         self.last_consumed = 0  # bits encoded so far (non-skip constrained slots placed)
 
     def _build_tables(self, V: int):
         print(f"[stego] indexing {V} tokens (one-time)...")
-        lbuck = [letter_buckets(self.tok.decode([i])) for i in range(V)]
-        buckets = np.full((V, STRIDE), -1, dtype=np.int8)   # -1 = no letter there
+        lbuck = [char_buckets(self.tok.decode([i])) for i in range(V)]
+        buckets = np.full((V, STRIDE), -1, dtype=np.int8)   # -1 = no char there
         for i, bs in enumerate(lbuck):
             for m in range(min(STRIDE, len(bs))):
                 buckets[i, m] = bs[m]
@@ -126,36 +129,35 @@ class Stego:
         buckets, lbuck, long_ids = self.tables
 
         gen = tokens[self.offset:].tolist()
-        letters = [c for c in self.tok.decode(gen) if c.isalpha()] if gen else []
-        nl = len(letters)
-        m0 = (STRIDE - nl % STRIDE) % STRIDE     # letters into next token until a constrained one
-        # bits consumed so far = non-skip letters already sitting on constrained slots
-        consumed = sum(char_bucket(letters[j]) != SKIP for j in range(0, nl, STRIDE))
+        chars = list(self.tok.decode(gen)) if gen else []
+        nc = len(chars)
+        m0 = (STRIDE - nc % STRIDE) % STRIDE      # chars into next token until a constrained one
+        # bits consumed so far = non-skip characters already on constrained slots
+        consumed = sum(char_bucket(chars[j]) != SKIP for j in range(0, nc, STRIDE))
         self.last_consumed = consumed
         if consumed >= len(self.bits):
             self.last_m0 = -1
             return logits                        # bitstream spent -> free
-        self.last_m0 = m0                        # 0 == the next letter carries a bit
+        self.last_m0 = m0                        # 0 == the next char carries a bit
         b = self.bits[consumed]
 
         vec = np.array(logits.astype(mx.float32)).reshape(-1)
-        # First constrained letter each token could place (residue m0). By bucket:
-        #   == b       -> encodes the wanted bit          (allowed, unchanged)
-        #   == 1 - b   -> encodes the wrong bit           (forbidden)
-        #   == SKIP    -> carries no bit                  (allowed, penalized)
-        #   == -1      -> token places no letter here     (see below)
+        # First constrained character each token could place (residue m0). By bucket:
+        #   == b       -> encodes the wanted bit                     (allowed, unchanged)
+        #   == 1 - b   -> encodes the wrong bit                      (forbidden)
+        #   == SKIP    -> carries no bit (incl. space/punctuation)   (allowed, penalized)
+        #   == -1      -> token places no character here             (see below)
         col = buckets[:, m0]
         vec[(col != -1) & (col != b) & (col != SKIP)] = -np.inf
         vec[col == SKIP] -= self.skip_penalty
-        # When the constrained letter is imminent (m0 == 0), a letter-free token
-        # (col == -1: '*', whitespace, punctuation, EOS) would defer the bit at
-        # zero cost and can loop forever ('****...'). Penalize it exactly like a
-        # skip so encoding stays the cheapest move, without forbidding filler.
+        # When the constrained char is imminent (m0 == 0), a token that places no
+        # character there (col == -1: an empty / EOS token) would defer the bit at
+        # zero cost. Penalize it like a skip so encoding stays the cheapest move.
         if m0 == 0:
             vec[col == -1] -= self.skip_penalty
-        # Tokens with more than STRIDE letters can reach further constrained slots;
-        # simulate each so a wrong bit anywhere in the token is forbidden. Skips
-        # inside the token defer the bit index rather than consuming it.
+        # Tokens with more than STRIDE characters can reach further constrained
+        # slots; simulate each so a wrong bit anywhere in the token is forbidden.
+        # Skips inside the token defer the bit index rather than consuming it.
         for i in long_ids:
             bs = lbuck[i]
             bi = consumed
@@ -366,24 +368,23 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=500,
 
 def verify(text: str, bits: list[int]) -> bool:
     """Read the bits back out of `text` and check they match `bits`."""
-    letters = [c for c in text if c.isalpha()]
-    slot_chars = letters[::STRIDE]
+    slot_chars = list(text)[::STRIDE]
     slot_buckets = [char_bucket(c) for c in slot_chars]
-    print("\n[stego] verification (every 5th letter; SKIP-bucket letters carry no bit):")
+    print(f"\n[stego] verification (every {STRIDE}th character; SKIP chars carry no bit):")
     ok_all = True
     bi = 0
     for k, bk in enumerate(slot_buckets):
         ch = slot_chars[k]
         j = k * STRIDE
         if bk == SKIP:
-            print(f"  letter {j:>4}  {ch!r:<6} bucket=SKIP  (skipped)")
+            print(f"  char {j:>4}  {ch!r:<6} bucket=SKIP  (skipped)")
             continue
         if bi >= len(bits):
-            print(f"  letter {j:>4}  {ch!r:<6} bit={bk}  (past end of bitstream)")
+            print(f"  char {j:>4}  {ch!r:<6} bit={bk}  (past end of bitstream)")
             continue
         ok = bk == bits[bi]
         ok_all &= ok
-        print(f"  letter {j:>4}  {ch!r:<6} bit={bk} want={bits[bi]}  {'OK' if ok else 'XX'}")
+        print(f"  char {j:>4}  {ch!r:<6} bit={bk} want={bits[bi]}  {'OK' if ok else 'XX'}")
         bi += 1
     for r in range(bi, len(bits)):
         print(f"  bit {r:>4}  <missing>  want={bits[r]}  XX")
@@ -395,7 +396,7 @@ def verify(text: str, bits: list[int]) -> bool:
 def encoding_summary(text: str, bits: list[int]) -> float:
     """Print encoding density: hidden bits per character of cover text. Skip slots
     (constrained positions carrying no bit) are not counted as encoded."""
-    slots = [c for c in text if c.isalpha()][::STRIDE]      # matched positions
+    slots = list(text)[::STRIDE]                            # matched positions (all chars)
     encoded = min(len(bits), sum(char_bucket(c) != SKIP for c in slots))
     bpc = encoded / len(text) if text else 0.0
     print(f"[stego] density: {encoded} bits / {len(text)} chars = {bpc:.4f} bits/char")
@@ -420,7 +421,7 @@ def main() -> None:
     ap.add_argument("--bits", required=True, help="bitstream to hide, e.g. 10110")
     ap.add_argument("--model", default="mlx-community/Qwen2.5-1.5B-Instruct-4bit")
     ap.add_argument("--stride", type=int, default=STRIDE,
-                    help="letters between encoding slots (smaller packs more data but is harder)")
+                    help="characters between encoding slots (smaller packs more data but is harder)")
     ap.add_argument("--max-tokens", type=int, default=500)
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--skip-penalty", type=float, default=SKIP_PENALTY,
