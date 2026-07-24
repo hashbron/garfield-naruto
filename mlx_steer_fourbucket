@@ -42,7 +42,7 @@ import numpy as np
 import mlx.core as mx
 from mlx_lm import load
 
-STRIDE = 5              # every STRIDE-th character is a constrained slot; 1 is
+STRIDE = 2              # every STRIDE-th character is a constrained slot; 1 is
                          # brutally restrictive (forces almost every letter of
                          # every word to comply) and tends to collapse into
                          # incoherent text — 5 gives the model room to breathe
@@ -78,9 +78,9 @@ def _make_buckets(freq: dict[str, float], n: int = 3) -> dict[str, int]:
     return members
 
 
-zero_set = {'c', 'e', 'y', 'w', 'r', 'k', 'n'}
-one_set = {'i', 'l', 'b', 'h', 'u', 'v', 't', 'g'}
-two_set = {'z', 'j', 'a', 'q', 'p', 'o', 'x', 's', 'f', 'm', 'd'}
+zero_set = {'c', 'e', 'y', 'w', 'r', 'k', 'n', 'A', 'B', 'C', 'D', 'E', 'F', 'G'}
+one_set = {'i', 'l', 'b', 'h', 'u', 'v', 't', 'g', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P'}
+two_set = {'z', 'j', 'a', 'q', 'p', 'o', 'x', 's', 'f', 'm', 'd', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', ','}
 
 bucket_dict = {}
 
@@ -96,23 +96,31 @@ _BUCKET = bucket_dict #_make_buckets(_FREQ)
 
 
 def char_bucket(ch: str) -> int:
-    """Which bucket a character falls in: 0 or 1 encode that bit; SKIP and
-    SKIP_FREE both carry none.
-
-    Non-alpha characters (punctuation, whitespace, digits, ...) always land in
-    SKIP_FREE. Alpha characters are folded to their base (é -> e, ñ -> n);
-    letters with no a-z base (non-Latin scripts) fall into SKIP, so they carry
-    no bit and can never be the wrong bit — just a (penalized) skip rather than
-    a free one, since they're still "letters" rather than punctuation."""
-    if not ch.isalpha():
-        return SKIP_FREE
-    c = ch.lower()
-    if c in _BUCKET:
-        return _BUCKET[c]
-    for base in unicodedata.normalize("NFKD", c):
+##    """Which bucket a character falls in: 0 or 1 encode that bit; SKIP and
+##    SKIP_FREE both carry none.
+##
+##    Non-alpha characters (punctuation, whitespace, digits, ...) always land in
+##    SKIP_FREE. Alpha characters are folded to their base (é -> e, ñ -> n);
+##    letters with no a-z base (non-Latin scripts) fall into SKIP, so they carry
+##    no bit and can never be the wrong bit — just a (penalized) skip rather than
+##    a free one, since they're still "letters" rather than punctuation."""
+##    if not ch.isalpha():
+##        return SKIP_FREE
+##    c = ch.lower()
+##    if c in _BUCKET:
+##        return _BUCKET[c]
+##    for base in unicodedata.normalize("NFKD", c):
+##        if base in _BUCKET:
+##            return _BUCKET[base]
+##    return SKIP
+    
+    if ch in _BUCKET:
+        return _BUCKET[ch]
+    for base in unicodedata.normalize("NFKD", ch):
         if base in _BUCKET:
             return _BUCKET[base]
-    return SKIP
+    return SKIP_FREE
+    
 
 
 def char_buckets(text: str) -> list[int]:
@@ -440,7 +448,7 @@ def main() -> None:
         ap.error("--bits must contain at least one 0 or 1")
 
     model, tokenizer = load(args.model)
-    messages = [{"role": "user", "content": f"Write a few sentences about: {args.topic}"}]
+    messages = [{"role": "user", "content": f"Write a paragraph of gender theory using as many nautical metaphors as possible. Give no preamble."}]
     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
     text = steer_generate(
