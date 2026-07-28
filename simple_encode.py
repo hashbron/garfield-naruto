@@ -39,6 +39,7 @@ from mlx_lm import load
 SKIP = 2                # penalized bit-less bucket (off-bucket alpha)
 SKIP_FREE = 3           # free bit-less bucket (non-alpha: space / punctuation / ...)
 BIT_BUCKETS = (0, 1)    # buckets that actually carry a bit
+EOS_RAMP = 2.0          # per-char EOS logit boost once past the tail budget (ends the tail)
 
 # Relative English letter frequencies (letters only), used once at import time to
 # greedily split the alphabet into three near-equiprobable buckets (0, 1, SKIP).
@@ -268,9 +269,9 @@ def _lookahead(enc: Encoder, model, cache, consumed_after: int, nlogits, *,
 
 def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperature=0.8,
                    skip_penalty=1.0, num_candidates=12, fluency_weight=3.0,
-                   bit_bonus=2.0, rollout_depth=3, top_p=0.95,
+                   bit_bonus=2.0, rollout_depth=3, tail_chars=200, top_p=0.95,
                    freq_penalty=0.5, rep_window=64, no_repeat_ngram=3,
-                   seed=0, verbose=False) -> str:
+                   seed=0, stream=False) -> str:
     """Stride-1 constrained decoding with a fluency-driven candidate search.
 
     Every character is a slot, so every step (until the payload is spent) is a
@@ -284,8 +285,11 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
          encodes, so encoding happens where it stays natural.
       4. Sample a winner from the combined scores at `temperature`/`top_p`.
 
-    Once the payload is fully encoded, generation continues unconstrained so the
-    text can finish naturally.
+    Once the payload is fully encoded, generation continues unconstrained. After
+    `tail_chars` more characters, EOS is progressively up-weighted (by `EOS_RAMP`
+    per overshoot char) so the model ends the cover text at a natural point soon
+    after — instead of a hard cut on the last hidden bit. `tail_chars == 0` steers
+    to an end as soon as the payload is in.
     """
     from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
     try:
@@ -308,13 +312,17 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
     enc._build(logits.shape[1])                          # vocab size known now
     use_lookahead = num_candidates > 1 and rollout_depth > 0 and can_trim_prompt_cache(cache)
 
-    consumed = 0
+    consumed, tail = 0, 0
     for _ in range(max_tokens):
+        in_tail = consumed >= enc.nbits
         raw = _vec(logits)
 
-        if consumed >= enc.nbits:                        # payload done -> free finish
+        if in_tail:                                      # payload done -> free finish
             base = _antirepeat(raw.copy(), tokens[offset:], freq_penalty=freq_penalty,
                                window=rep_window, no_repeat_ngram=no_repeat_ngram)
+            if tail >= tail_chars:                       # past the tail budget: up-weight EOS,
+                for e in eos_ids:                        # ramping with overshoot so the model
+                    base[e] += EOS_RAMP * (tail - tail_chars + 1)  # ends at a natural point soon
             choice = _sample_logits(base, temperature, rng, top_p)
         else:
             masked, bits_enc = enc.constrain(consumed, raw)
@@ -341,15 +349,17 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
                 choice = int(cand[_sample_logits(combined, temperature, rng, top_p)])
             consumed += int(bits_enc[choice])
 
+        if choice in eos_ids:                            # natural end (payload already encoded);
+            break                                        # don't append, so no EOS marker leaks in
         tokens.append(choice)
-        if choice in eos_ids:                            # only reachable once payload is done
-            break
+        if stream:                                       # print each token the moment it's finalized
+            print(tokenizer.decode([choice]), end="", flush=True)
+        if in_tail:
+            tail += len(tokenizer.decode([choice]))
         logits = model(mx.array([[choice]]), cache=cache)[:, -1, :]
         mx.eval(logits)
-        if verbose:
-            print(tokenizer.decode([choice]), end="", flush=True)
 
-    if verbose:
+    if stream:
         print()
     return tokenizer.decode(tokens[offset:])
 
@@ -360,6 +370,21 @@ def encoding_summary(text: str, bits: list[int]) -> float:
     bpc = encoded / len(text) if text else 0.0
     print(f"[stego] density: {encoded} bits / {len(text)} chars = {bpc:.4f} bits/char")
     return bpc
+
+
+def build_prompt(tokenizer, topic: str, think: bool):
+    """Chat prompt for the cover text.
+
+    Thinking models (SmolLM3, Qwen3, ...) accept `enable_thinking`; leaving it off
+    stops the model emitting a <think> reasoning block, which would otherwise get
+    stego-encoded into the payload as garbage. Models whose tokenizer doesn't take
+    the argument fall back to the plain template unchanged."""
+    messages = [{"role": "user", "content": f"Write a short story about: {topic}"}]
+    try:
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=True,
+                                             enable_thinking=think)
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
 
 def main() -> None:
@@ -373,8 +398,11 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--topic", required=True, help="what the cover text is about")
     ap.add_argument("--bits", required=True, help="bitstream to hide, e.g. 10110")
-    ap.add_argument("--model", default="mlx-community/Qwen2.5-1.5B-Instruct-4bit")
+    ap.add_argument("--model", default="mlx-community/SmolLM3-3B-8bit",
+                    help="mlx-community model id (8-bit / less-peaky models give better constrained fluency)")
     ap.add_argument("--max-tokens", type=int, default=800)
+    ap.add_argument("--tail-chars", type=int, default=200,
+                    help="free cover text after the payload; past it, EOS is up-weighted to end naturally")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--skip-penalty", type=float, default=1.0,
                     help="logit penalty per off-bucket-letter (SKIP) character")
@@ -386,8 +414,12 @@ def main() -> None:
                     help="score reward per bit a candidate encodes (raises density vs fluency)")
     ap.add_argument("--rollout-depth", type=int, default=3,
                     help="constrained steps looked ahead to judge fluency (0 disables lookahead)")
+    ap.add_argument("--think", action="store_true",
+                    help="allow the model to emit <think> reasoning (default off; thinking "
+                         "models like SmolLM3/Qwen3 otherwise encode a reasoning block as garbage)")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--quiet", action="store_true",
+                    help="don't stream the cover text as it is generated (default: stream progress)")
     args = ap.parse_args()
 
     bits = parse_bits(args.bits)
@@ -395,12 +427,12 @@ def main() -> None:
         ap.error("--bits must contain at least one 0 or 1")
 
     model, tokenizer = load(args.model)
-    messages = [{"role": "user", "content": f"Write a short story about: {args.topic}"}]
-    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    prompt = build_prompt(tokenizer, args.topic, args.think)
 
     text = steer_generate(
         model, tokenizer, prompt, bits,
         max_tokens=args.max_tokens,
+        tail_chars=args.tail_chars,
         temperature=args.temperature,
         skip_penalty=args.skip_penalty,
         num_candidates=args.candidates,
@@ -412,11 +444,12 @@ def main() -> None:
         rep_window=REP_WINDOW,
         no_repeat_ngram=NO_REPEAT_NGRAM,
         seed=args.seed,
-        verbose=args.verbose,
+        stream=not args.quiet,
     )
 
-    print("\n" + "=" * 60)
-    print(text)
+    if args.quiet:                          # streaming already showed the text live
+        print("\n" + "=" * 60)
+        print(text)
     ok = verify(text, bits)
     encoding_summary(text, bits)
     raise SystemExit(0 if ok else 1)
