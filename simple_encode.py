@@ -232,53 +232,56 @@ def _antirepeat(vec: np.ndarray, gen_ids: list[int], *, freq_penalty: float,
     return vec
 
 
-def _lookahead(enc: Encoder, model, cache, consumed_after: int, nlogits, *, depth: int,
-               log_floor: float, eos_ids: set, trim) -> float:
-    """Score one already-advanced candidate by how un-cornered it leaves the model.
+def _lookahead(enc: Encoder, model, cache, consumed_after: int, nlogits, *,
+               depth: int, eos_ids: set, trim) -> float:
+    """Fluency of committing to an already-advanced candidate.
 
-    Sums a floored 'valid-mass' term over the step right after the candidate plus
-    `depth` further greedy constrained steps. Terms are <= 0, so a candidate that
-    keeps plenty of natural mass on constraint-valid tokens scores 0, while one
-    that paints the model into a corner (little valid mass, i.e. bad for both
-    fluency and future density) is penalized. Cache is restored to the
-    tokens+[candidate] state; the caller undoes the candidate itself."""
+    Greedily runs the *constrained* rollout `depth` steps forward and returns the
+    mean log-probability the model itself assigns to each token it is forced onto
+    (`log P_model(argmax of the allowed set)`). Near 0 => the constraint isn't
+    fighting the model here, so the continuation is fluent; very negative => the
+    model keeps being pushed onto tokens it dislikes, i.e. garbled text ahead.
+    This is a live signal (unlike a cornered-mass floor, which skip tokens keep
+    from ever triggering). Cache is restored to the tokens+[candidate] state; the
+    caller undoes the candidate itself."""
     rawn = _vec(nlogits)
-    masked, _ = enc.constrain(consumed_after, rawn)
-    total = min(0.0, (_logsumexp(masked) - _logsumexp(rawn)) - log_floor)
-    cur_masked, cur_consumed, advanced = masked, consumed_after, 0
+    total, steps, advanced, cur = 0.0, 0, 0, consumed_after
     for _ in range(depth):
-        if cur_consumed >= enc.nbits:
-            break
-        nxt = int(np.argmax(cur_masked))
+        masked, _ = enc.constrain(cur, rawn)
+        if cur < enc.nbits:                          # don't let the probe "stop" to dodge
+            for e in eos_ids:
+                masked[e] = -np.inf
+        nxt = int(np.argmax(masked))
+        total += float(rawn[nxt]) - _logsumexp(rawn)  # log P_model of the forced token
+        steps += 1
         clog = model(mx.array([[nxt]]), cache=cache)[:, -1, :]
         mx.eval(clog)
         advanced += 1
         if nxt in eos_ids:
             break
-        cur_consumed += enc.bits_of(nxt, cur_consumed)
+        cur += enc.bits_of(nxt, cur)
         rawn = _vec(clog)
-        cur_masked, _ = enc.constrain(cur_consumed, rawn)
-        total += min(0.0, (_logsumexp(cur_masked) - _logsumexp(rawn)) - log_floor)
     if advanced:
         trim(cache, advanced)
-    return total
+    return total / steps if steps else 0.0
 
 
 def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperature=0.8,
-                   skip_penalty=1.0, num_candidates=16, lookahead_weight=8.0,
-                   lookahead_floor=0.05, bit_bonus=3.0, rollout_depth=0, top_p=0.95,
+                   skip_penalty=1.0, num_candidates=12, fluency_weight=3.0,
+                   bit_bonus=2.0, rollout_depth=3, top_p=0.95,
                    freq_penalty=0.5, rep_window=64, no_repeat_ngram=3,
                    seed=0, verbose=False) -> str:
-    """Stride-1 constrained decoding with density-aware candidate search.
+    """Stride-1 constrained decoding with a fluency-driven candidate search.
 
     Every character is a slot, so every step (until the payload is spent) is a
     constrained encoding step. Each such step:
 
       1. Constrain the whole vocab (vectorized) and block EOS while bits remain.
-      2. Shortlist the top `num_candidates` valid tokens by  logit + bit_bonus *
-         (bits it encodes)  — so the trial set is biased toward real density.
-      3. Trial-run each shortlisted token one forward pass; score it with
-         `_lookahead` (does it corner the model?) plus its own density bonus.
+      2. Shortlist the top `num_candidates` valid tokens by the model's own
+         probability — the fluent options, encoding or skip alike.
+      3. Trial-run each; score it with `_lookahead` (mean log-prob of the forced
+         constrained continuation = fluency) plus a `bit_bonus` per bit it
+         encodes, so encoding happens where it stays natural.
       4. Sample a winner from the combined scores at `temperature`/`top_p`.
 
     Once the payload is fully encoded, generation continues unconstrained so the
@@ -296,7 +299,6 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
     eos_ids = set(getattr(tokenizer, "eos_token_ids", None) or
                   ([tokenizer.eos_token_id]
                    if getattr(tokenizer, "eos_token_id", None) is not None else []))
-    log_floor = float(np.log(lookahead_floor)) if lookahead_floor > 0 else -np.inf
 
     tokens = list(prompt)
     offset = len(prompt)
@@ -304,7 +306,7 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
     logits = model(mx.array(prompt)[None], cache=cache)[:, -1, :]
     mx.eval(logits)
     enc._build(logits.shape[1])                          # vocab size known now
-    use_lookahead = lookahead_weight > 0.0 and num_candidates > 1 and can_trim_prompt_cache(cache)
+    use_lookahead = num_candidates > 1 and rollout_depth > 0 and can_trim_prompt_cache(cache)
 
     consumed = 0
     for _ in range(max_tokens):
@@ -320,22 +322,21 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
                 masked[e] = -np.inf
             base = _antirepeat(masked.copy(), tokens[offset:], freq_penalty=freq_penalty,
                                window=rep_window, no_repeat_ngram=no_repeat_ngram)
-            score = base + bit_bonus * bits_enc          # density-aware ranking
             if not use_lookahead:
-                choice = _sample_logits(score, temperature, rng, top_p)
+                choice = _sample_logits(base + bit_bonus * bits_enc, temperature, rng, top_p)
             else:
+                logp = base - _logsumexp(base)               # immediate fluency (log-softmax)
                 valid = np.where(np.isfinite(base))[0]
                 k = min(num_candidates, valid.size)
-                cand = valid[np.argsort(score[valid])[-k:]]  # trial the most promising
+                cand = valid[np.argsort(base[valid])[-k:]]   # shortlist = what the model wants
                 combined = np.empty(k)
                 for j, c in enumerate(cand):
                     c = int(c)
                     nlogits = model(mx.array([[c]]), cache=cache)[:, -1, :]
                     mx.eval(nlogits)
                     look = _lookahead(enc, model, cache, consumed + int(bits_enc[c]), nlogits,
-                                      depth=rollout_depth, log_floor=log_floor,
-                                      eos_ids=eos_ids, trim=trim_prompt_cache)
-                    combined[j] = base[c] + bit_bonus * bits_enc[c] + lookahead_weight * look
+                                      depth=rollout_depth, eos_ids=eos_ids, trim=trim_prompt_cache)
+                    combined[j] = logp[c] + fluency_weight * look + bit_bonus * bits_enc[c]
                     trim_prompt_cache(cache, 1)          # undo the trial token
                 choice = int(cand[_sample_logits(combined, temperature, rng, top_p)])
             consumed += int(bits_enc[choice])
@@ -363,7 +364,6 @@ def encoding_summary(text: str, bits: list[int]) -> float:
 
 def main() -> None:
     # --- fixed tuning knobs (edit here; kept off the CLI) ---
-    LOOKAHEAD_FLOOR = 0.05   # penalize a candidate only below this valid-mass fraction
     TOP_P           = 0.95   # nucleus sampling cutoff
     FREQ_PENALTY    = 0.5    # anti-repetition: penalty per recent token occurrence
     REP_WINDOW      = 64     # anti-repetition: recent-token window
@@ -378,14 +378,14 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--skip-penalty", type=float, default=1.0,
                     help="logit penalty per off-bucket-letter (SKIP) character")
-    ap.add_argument("--candidates", type=int, default=16,
-                    help="valid tokens trial-run per step (higher = more density, slower)")
-    ap.add_argument("--lookahead-weight", type=float, default=8.0,
-                    help="weight of the lookahead corner-avoidance score (0 disables)")
-    ap.add_argument("--bit-bonus", type=float, default=3.0,
-                    help="score reward per bit a candidate encodes (raises density)")
-    ap.add_argument("--rollout-depth", type=int, default=0,
-                    help="extra greedy constrained steps to look past each candidate")
+    ap.add_argument("--candidates", type=int, default=12,
+                    help="valid tokens trial-run per step (more = better search, slower)")
+    ap.add_argument("--fluency-weight", type=float, default=3.0,
+                    help="weight of the continuation-fluency score (0 = ignore fluency)")
+    ap.add_argument("--bit-bonus", type=float, default=2.0,
+                    help="score reward per bit a candidate encodes (raises density vs fluency)")
+    ap.add_argument("--rollout-depth", type=int, default=3,
+                    help="constrained steps looked ahead to judge fluency (0 disables lookahead)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
@@ -404,8 +404,7 @@ def main() -> None:
         temperature=args.temperature,
         skip_penalty=args.skip_penalty,
         num_candidates=args.candidates,
-        lookahead_weight=args.lookahead_weight,
-        lookahead_floor=LOOKAHEAD_FLOOR,
+        fluency_weight=args.fluency_weight,
         bit_bonus=args.bit_bonus,
         rollout_depth=args.rollout_depth,
         top_p=TOP_P,

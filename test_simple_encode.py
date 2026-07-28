@@ -98,7 +98,7 @@ def test_roundtrip():
     for t in range(120):
         bits = [random.Random(1000 + t).randint(0, 1) for _ in range(random.Random(t).randint(3, 10))]
         txt = quiet(s.steer_generate, make_model(t), tok, [VOCAB.index("the")], bits,
-                    max_tokens=400, temperature=0.7, num_candidates=8, lookahead_weight=8.0,
+                    max_tokens=400, temperature=0.7, num_candidates=8, fluency_weight=3.0,
                     bit_bonus=3.0, rollout_depth=1, seed=t)
         if s.extract(txt)[:len(bits)] != bits: fails += 1
         if wrongbit(txt, bits): viol += 1
@@ -114,7 +114,7 @@ def test_cache_neutral():
     cmod.make_prompt_cache = lambda model, *a, **k: (lambda c: (caches.append(c) or c))(orig(model))
     bits = [1, 0, 1, 1, 0, 0, 1]
     txt = quiet(s.steer_generate, make_model(5), tok, [VOCAB.index("the")], bits,
-                max_tokens=300, num_candidates=8, lookahead_weight=8.0, rollout_depth=2, seed=5)
+                max_tokens=300, num_candidates=8, fluency_weight=3.0, rollout_depth=2, seed=5)
     cmod.make_prompt_cache = orig
     ok = tok.decode(caches[0][0].seq[1:]) == txt and s.extract(txt)[:len(bits)] == bits
     print(f"(3) cache decodes to output exactly & encodes: {ok}")
