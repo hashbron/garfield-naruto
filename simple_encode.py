@@ -24,22 +24,43 @@ model in a fluent, un-cornered state. The best-scoring candidate is sampled. Thi
 is what lets a maximal-density (stride-1) constraint still produce plausible text.
 
     pip install mlx-lm
-    python simple_encode.py --topic "the sea" --bits 10110
+    python simple_encode.py --topic "the sea" --message "meet at dawn"
+    python simple_encode.py --topic "the sea" --bits 10110       # raw bits instead
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import unicodedata
+from functools import lru_cache
 
 import numpy as np
 import mlx.core as mx
 from mlx_lm import load
 
-SKIP = 2                # penalized bit-less bucket (off-bucket alpha)
-SKIP_FREE = 3           # free bit-less bucket (non-alpha: space / punctuation / ...)
-BIT_BUCKETS = (0, 1)    # buckets that actually carry a bit
+SKIP = 2                # penalized bit-less role (a letter assigned "skip" this position)
+SKIP_FREE = 3           # free bit-less role (whitelisted prose punctuation / whitespace)
+FORBIDDEN = 4           # non-whitelisted non-alpha (control / combining / exotic): -inf, never emitted
+BIT_BUCKETS = (0, 1)    # roles that actually carry a bit
 EOS_RAMP = 2.0          # per-char EOS logit boost once past the tail budget (ends the tail)
+
+# `char_group` codes: 0-25 are the 26 letters (by index); the rest tag fixed,
+# non-shuffled characters.
+G_PUNCT = 26            # whitelisted punctuation  -> SKIP_FREE (fixed, free)
+G_NONLATIN = 27         # non-Latin letter         -> FORBIDDEN (never emitted)
+G_JUNK = 28             # control / combining / ... -> FORBIDDEN (never emitted)
+
+# Non-alpha characters that are FREE skips (natural in ordinary prose). Everything
+# else non-alpha — control chars, combining marks, exotic Unicode, and formatting
+# punctuation — is a *penalized* skip instead, closing the free-escape-hatch that
+# let generation spiral into junk Unicode. This mirrors the older mlx_steer builds,
+# whose hand-tuned skip set specifically penalized \n \t * | \ / _ etc.
+FREE_CHARS = frozenset(
+    " .,;:!?'\"()-"                                  # space + common ASCII sentence punctuation
+    "0123456789"                                     # digits appear in normal prose
+    "‘’“”–—…"     # curly quotes, en/em dash, ellipsis
+)
 
 # Relative English letter frequencies (letters only), used once at import time to
 # greedily split the alphabet into three near-equiprobable buckets (0, 1, SKIP).
@@ -66,40 +87,82 @@ def _make_buckets(freq: dict[str, float], n: int = 3) -> dict[str, int]:
 
 _BUCKET = _make_buckets(_FREQ)
 
+_ALPHA = "abcdefghijklmnopqrstuvwxyz"
+_LIDX = {c: i for i, c in enumerate(_ALPHA)}
+_LFREQ = np.array([_FREQ[c] for c in _ALPHA])               # frequency by letter index
+_BASE_ROLE = np.array([_BUCKET[c] for c in _ALPHA], dtype=np.int8)  # key=None assignment
+_BASE_ROLE.setflags(write=False)
+
 
 def parse_bits(s: str) -> list[int]:
     return [1 if c == "1" else 0 for c in s if c in "01"]
 
 
-def char_bucket(ch: str) -> int:
-    """Which bucket a character falls in. 0/1 carry a bit; SKIP and SKIP_FREE
-    carry none. Non-alpha -> SKIP_FREE (free). Alpha folds to its a-z base
-    (é -> e); a letter with no a-z base -> SKIP (a penalized, not free, skip)."""
+@lru_cache(maxsize=1 << 18)
+def _letter_roles(key, pos: int) -> np.ndarray:
+    """Keyed assignment of all 26 letters to roles {bit0=0, bit1=1, SKIP=2} at
+    character position `pos`. This reshuffles *membership* every position (not just
+    relabels three fixed groups), so no fixed letter clustering survives — over
+    text each letter lands in each role about equally. A greedy pass in a keyed
+    order fills the currently lightest role, keeping each role ~1/3 of letter
+    frequency for fluency. key=None returns the fixed base assignment."""
+    if key is None:
+        return _BASE_ROLE
+    seed = int.from_bytes(hashlib.sha256(f"{key}|{pos}".encode()).digest()[:8], "big")
+    order = np.random.default_rng(seed).permutation(26)
+    sums = [0.0, 0.0, 0.0]
+    role = np.empty(26, dtype=np.int8)
+    for L in order:
+        r = int(np.argmin(sums))
+        role[L] = r
+        sums[r] += _LFREQ[L]
+    role.setflags(write=False)
+    return role
+
+
+def char_group(ch: str) -> int:
+    """Key-independent class of a character: 0-25 = letter index (shuffled per
+    position); G_PUNCT = whitelisted punctuation; G_NONLATIN = non-Latin letter;
+    G_JUNK = control/combining/exotic. The last two are never emitted."""
     if not ch.isalpha():
-        return SKIP_FREE
+        return G_PUNCT if ch in FREE_CHARS else G_JUNK
     c = ch.lower()
-    if c in _BUCKET:
-        return _BUCKET[c]
+    if c in _LIDX:
+        return _LIDX[c]
     for base in unicodedata.normalize("NFKD", c):
-        if base in _BUCKET:
-            return _BUCKET[base]
-    return SKIP
+        if base in _LIDX:
+            return _LIDX[base]
+    return G_NONLATIN
 
 
-def char_buckets(text: str) -> list[int]:
-    """Bucket of every character in `text`, in order."""
-    return [char_bucket(c) for c in text]
+def char_role(ch: str, pos: int = 0, key=None) -> int:
+    """Bit-role of `ch` at character position `pos` under `key`: 0/1 encode a bit;
+    SKIP/SKIP_FREE carry none; FORBIDDEN is never emitted. Only the 26 letters are
+    shuffled by the key — punctuation is a free skip, and non-Latin letters and junk
+    are forbidden (they are always-legal characters, i.e. escape hatches)."""
+    g = char_group(ch)
+    if g in (G_JUNK, G_NONLATIN):
+        return FORBIDDEN
+    if g < 26:                                          # a letter
+        return int(_letter_roles(key, pos)[g])
+    return SKIP_FREE
 
 
-def extract(text: str) -> list[int]:
-    """Recover the hidden bitstream: every bit-bucket character, in order,
-    dropping both flavors of skip."""
-    return [b for b in char_buckets(text) if b in BIT_BUCKETS]
+def char_bucket(ch: str) -> int:
+    """Unkeyed base role — used by tests and reporting."""
+    return char_role(ch, 0, None)
 
 
-def verify(text: str, bits: list[int]) -> bool:
-    """Check the payload reads back out of `text`."""
-    got = extract(text)
+def extract(text: str, key=None) -> list[int]:
+    """Recover the hidden bitstream: at each character position apply the keyed
+    alphabet and keep the bit-carrying roles, dropping every flavor of skip."""
+    return [r for pos, ch in enumerate(text)
+            for r in (char_role(ch, pos, key),) if r in BIT_BUCKETS]
+
+
+def verify(text: str, bits: list[int], key=None) -> bool:
+    """Check the payload reads back out of `text` under `key`."""
+    got = extract(text, key)
     ok = got[:len(bits)] == bits
     print(f"\n[stego] recovered {min(len(got), len(bits))}/{len(bits)} payload bits"
           f"{'' if len(got) <= len(bits) else f' (+{len(got) - len(bits)} free tail bits)'}")
@@ -114,64 +177,89 @@ def verify(text: str, bits: list[int]) -> bool:
 
 
 class Encoder:
-    """Vectorized stride-1 four-bucket constraint over the whole vocabulary.
+    """Vectorized keyed stride-1 constraint over the whole vocabulary.
 
-    Precomputes, per token, the sequence of bit-bucket values its characters
-    would encode (`ENC`), its length (`enc_len`), and how many *penalized* skip
-    characters it contains (`nskip`). Given how many payload bits are already
-    consumed, `constrain` forbids any token whose encoded bits would disagree
-    with the upcoming payload and penalizes penalized-skip characters."""
+    Precomputes, per token, the `char_group` code (`CHR`) of each of its characters
+    (0-25 letter index, G_PUNCT, G_NONLATIN, or -1 padding) and a junk flag. At each
+    step `constrain` applies the secret key's per-character-position letter->role
+    map to get each character's live role, then (vectorized) forbids any token whose
+    bit-carrying characters would disagree with the upcoming payload and penalizes
+    skip characters. `key=None` reproduces the fixed unkeyed scheme."""
 
-    def __init__(self, tok, bits: list[int], skip_penalty: float):
+    def __init__(self, tok, bits: list[int], skip_penalty: float, key=None):
         self.tok = tok
         self.bits = np.array(bits, dtype=np.int8)
         self.nbits = len(bits)
+        self.bits_pad = np.append(self.bits, np.int8(-1))   # sentinel for out-of-range gathers
         self.skip_penalty = skip_penalty
+        self.key = key
         self.tables = None
 
     def _build(self, V: int):
         print(f"[stego] indexing {V} tokens (one-time)...")
-        rows: list[list[int]] = []
-        nskip = np.zeros(V, dtype=np.float32)
-        enc_len = np.zeros(V, dtype=np.int32)
-        max_e = 1
+        self.junk = np.zeros(V, dtype=bool)
+        max_c = 1
+        rows = []
         for i in range(V):
-            bs = char_buckets(self.tok.decode([i]))
-            enc = [x for x in bs if x in BIT_BUCKETS]
-            rows.append(enc)
-            enc_len[i] = len(enc)
-            nskip[i] = sum(1 for x in bs if x == SKIP)
-            if len(enc) > max_e:
-                max_e = len(enc)
-        ENC = np.full((V, max_e), -1, dtype=np.int8)   # -1 = no encoding char here
-        for i, enc in enumerate(rows):
-            if enc:
-                ENC[i, :len(enc)] = enc
-        self.tables = (ENC, enc_len, nskip, max_e)
+            gs = [char_group(c) for c in self.tok.decode([i])]
+            rows.append(gs)
+            # A FORBIDDEN *role* does not block a token by itself — only this mask
+            # does — so every never-emit class has to be collected here. Non-Latin
+            # letters (CJK/Greek/Cyrillic) were previously a penalized-but-always-
+            # legal SKIP, i.e. a guaranteed escape hatch that got used once pricing
+            # closed the space and punctuation ones.
+            self.junk[i] = (G_JUNK in gs) or (G_NONLATIN in gs)
+            if len(gs) > max_c:
+                max_c = len(gs)
+        CHR = np.full((V, max_c), -1, dtype=np.int16)   # char_group code per char, -1 = padding
+        for i, gs in enumerate(rows):
+            if gs:
+                CHR[i, :len(gs)] = gs
+        self.CHR, self.max_c = CHR, max_c
 
-    def bits_of(self, token: int, consumed: int) -> int:
-        """How many payload bits token `token` would encode starting at `consumed`."""
-        _, enc_len, _, _ = self.tables
-        return int(min(int(enc_len[token]), max(0, self.nbits - consumed)))
+    def _roles(self, char_pos: int):
+        """(V, max_c) live role of each token character at the given char position."""
+        E = self.max_c
+        rmap = np.stack([_letter_roles(self.key, char_pos + k) for k in range(E)])   # (E, 26)
+        role = rmap[np.arange(E)[None, :], np.clip(self.CHR, 0, 25)]  # letters -> bit0/bit1/SKIP
+        role = np.where(self.CHR == G_PUNCT, SKIP_FREE, role)        # punctuation: free skip
+        role = np.where(self.CHR == G_NONLATIN, FORBIDDEN, role)     # non-Latin letter: never emit
+        role = np.where(self.CHR == G_JUNK, FORBIDDEN, role)         # junk: never emitted
+        role = np.where(self.CHR == -1, -1, role)                    # padding
+        return role
 
-    def constrain(self, consumed: int, vec: np.ndarray):
-        """Return (masked_logits, bits_encoded_per_token) at payload position
-        `consumed`. Forbidden tokens -> -inf; penalized-skip chars subtract
-        `skip_penalty` each. `bits_encoded` is 0 for forbidden tokens."""
-        ENC, enc_len, nskip, E = self.tables
+    def token_bits(self, token: int, char_pos: int, consumed: int) -> int:
+        """How many payload bits `token` encodes if placed at `char_pos` given `consumed`."""
         rem = self.nbits - consumed
-        if rem <= 0:                                    # payload spent -> unconstrained
-            return vec.copy(), np.zeros(vec.shape[0], dtype=np.int32)
-        kk = np.arange(E)
-        valid = kk < rem                                # slots still inside the payload
-        m = min(E, rem)
-        target = np.full(E, -1, dtype=np.int8)
-        target[:m] = self.bits[consumed:consumed + m]
-        # forbidden: any encoding char that lands on a payload slot with wrong bit
-        bad = ((ENC != -1) & valid[None, :] & (ENC != target[None, :])).any(axis=1)
-        out = vec - self.skip_penalty * nskip           # penalize off-bucket-letter skips
+        if rem <= 0:
+            return 0
+        n = 0
+        for k, ch in enumerate(self.tok.decode([token])):
+            if char_role(ch, char_pos + k, self.key) in BIT_BUCKETS:
+                n += 1
+                if n >= rem:
+                    break
+        return n
+
+    def constrain(self, consumed: int, char_pos: int, vec: np.ndarray):
+        """Return (masked_logits, bits_encoded_per_token) at payload bit `consumed`
+        and character position `char_pos`. Wrong-bit and junk tokens -> -inf; each
+        skip character subtracts `skip_penalty`."""
+        rem = self.nbits - consumed
+        if rem <= 0:                                    # payload spent -> only junk forbidden
+            out = vec.copy()
+            out[self.junk] = -np.inf
+            return out, np.zeros(vec.shape[0], dtype=np.int32)
+        role = self._roles(char_pos)                    # (V, max_c) live roles
+        enc_mask = (role == 0) | (role == 1)            # bit-carrying characters
+        cum = np.cumsum(enc_mask, axis=1) - enc_mask    # payload-bit offset of each enc char
+        bit_pos = consumed + cum
+        within = enc_mask & (bit_pos < self.nbits)      # enc chars still inside the payload
+        target = self.bits_pad[np.clip(bit_pos, 0, self.nbits)]
+        bad = (within & (role != target)).any(axis=1) | self.junk
+        out = vec - self.skip_penalty * (role == SKIP).sum(axis=1)
         out[bad] = -np.inf
-        bits_enc = np.minimum(enc_len, rem).astype(np.int32)
+        bits_enc = within.sum(axis=1).astype(np.int32)
         bits_enc[bad] = 0
         return out, bits_enc
 
@@ -233,22 +321,21 @@ def _antirepeat(vec: np.ndarray, gen_ids: list[int], *, freq_penalty: float,
     return vec
 
 
-def _lookahead(enc: Encoder, model, cache, consumed_after: int, nlogits, *,
-               depth: int, eos_ids: set, trim) -> float:
+def _lookahead(enc: Encoder, model, cache, consumed_after: int, char_pos_after: int,
+               nlogits, *, depth: int, eos_ids: set, trim) -> float:
     """Fluency of committing to an already-advanced candidate.
 
     Greedily runs the *constrained* rollout `depth` steps forward and returns the
-    mean log-probability the model itself assigns to each token it is forced onto
-    (`log P_model(argmax of the allowed set)`). Near 0 => the constraint isn't
-    fighting the model here, so the continuation is fluent; very negative => the
-    model keeps being pushed onto tokens it dislikes, i.e. garbled text ahead.
-    This is a live signal (unlike a cornered-mass floor, which skip tokens keep
-    from ever triggering). Cache is restored to the tokens+[candidate] state; the
-    caller undoes the candidate itself."""
+    mean log-probability the model itself assigns to each token it is forced onto.
+    Near 0 => the constraint isn't fighting the model here (fluent continuation);
+    very negative => it keeps being pushed onto tokens it dislikes (garbled ahead).
+    Tracks the character position so the keyed alphabet stays consistent. Cache is
+    restored to the tokens+[candidate] state; the caller undoes the candidate."""
     rawn = _vec(nlogits)
-    total, steps, advanced, cur = 0.0, 0, 0, consumed_after
+    total, steps, advanced = 0.0, 0, 0
+    cur, cpos = consumed_after, char_pos_after
     for _ in range(depth):
-        masked, _ = enc.constrain(cur, rawn)
+        masked, _ = enc.constrain(cur, cpos, rawn)
         if cur < enc.nbits:                          # don't let the probe "stop" to dodge
             for e in eos_ids:
                 masked[e] = -np.inf
@@ -260,7 +347,8 @@ def _lookahead(enc: Encoder, model, cache, consumed_after: int, nlogits, *,
         advanced += 1
         if nxt in eos_ids:
             break
-        cur += enc.bits_of(nxt, cur)
+        cur += enc.token_bits(nxt, cpos, cur)
+        cpos += len(enc.tok.decode([nxt]))
         rawn = _vec(clog)
     if advanced:
         trim(cache, advanced)
@@ -271,7 +359,7 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
                    skip_penalty=1.0, num_candidates=12, fluency_weight=3.0,
                    bit_bonus=2.0, rollout_depth=3, tail_chars=200, top_p=0.95,
                    freq_penalty=0.5, rep_window=64, no_repeat_ngram=3,
-                   seed=0, stream=False) -> str:
+                   seed=0, key=None, stream=False) -> str:
     """Stride-1 constrained decoding with a fluency-driven candidate search.
 
     Every character is a slot, so every step (until the payload is spent) is a
@@ -298,7 +386,7 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
         def can_trim_prompt_cache(_cache):
             return True
 
-    enc = Encoder(tokenizer, bits, skip_penalty)
+    enc = Encoder(tokenizer, bits, skip_penalty, key)
     rng = np.random.default_rng(seed)
     eos_ids = set(getattr(tokenizer, "eos_token_ids", None) or
                   ([tokenizer.eos_token_id]
@@ -310,6 +398,9 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
     logits = model(mx.array(prompt)[None], cache=cache)[:, -1, :]
     mx.eval(logits)
     enc._build(logits.shape[1])                          # vocab size known now
+    for e in eos_ids:                                    # EOS decodes to '<|..|>' (junk chars) but
+        if e < enc.junk.size:                            # must stay usable to end the cover text
+            enc.junk[e] = False
     use_lookahead = num_candidates > 1 and rollout_depth > 0 and can_trim_prompt_cache(cache)
 
     consumed, tail = 0, 0
@@ -320,12 +411,14 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
         if in_tail:                                      # payload done -> free finish
             base = _antirepeat(raw.copy(), tokens[offset:], freq_penalty=freq_penalty,
                                window=rep_window, no_repeat_ngram=no_repeat_ngram)
+            base[enc.junk] = -np.inf                     # keep junk out of the free tail too
             if tail >= tail_chars:                       # past the tail budget: up-weight EOS,
                 for e in eos_ids:                        # ramping with overshoot so the model
                     base[e] += EOS_RAMP * (tail - tail_chars + 1)  # ends at a natural point soon
             choice = _sample_logits(base, temperature, rng, top_p)
         else:
-            masked, bits_enc = enc.constrain(consumed, raw)
+            char_pos = len(tokenizer.decode(tokens[offset:]))   # keyed alphabet needs the position
+            masked, bits_enc = enc.constrain(consumed, char_pos, raw)
             for e in eos_ids:                            # never stop mid-payload
                 masked[e] = -np.inf
             base = _antirepeat(masked.copy(), tokens[offset:], freq_penalty=freq_penalty,
@@ -342,7 +435,8 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
                     c = int(c)
                     nlogits = model(mx.array([[c]]), cache=cache)[:, -1, :]
                     mx.eval(nlogits)
-                    look = _lookahead(enc, model, cache, consumed + int(bits_enc[c]), nlogits,
+                    look = _lookahead(enc, model, cache, consumed + int(bits_enc[c]),
+                                      char_pos + len(tokenizer.decode([c])), nlogits,
                                       depth=rollout_depth, eos_ids=eos_ids, trim=trim_prompt_cache)
                     combined[j] = logp[c] + fluency_weight * look + bit_bonus * bits_enc[c]
                     trim_prompt_cache(cache, 1)          # undo the trial token
@@ -364,9 +458,9 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
     return tokenizer.decode(tokens[offset:])
 
 
-def encoding_summary(text: str, bits: list[int]) -> float:
+def encoding_summary(text: str, bits: list[int], key=None) -> float:
     """Print encoding density: hidden bits per character of cover text."""
-    encoded = min(len(bits), len(extract(text)))
+    encoded = min(len(bits), len(extract(text, key)))
     bpc = encoded / len(text) if text else 0.0
     print(f"[stego] density: {encoded} bits / {len(text)} chars = {bpc:.4f} bits/char")
     return bpc
@@ -397,7 +491,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--topic", required=True, help="what the cover text is about")
-    ap.add_argument("--bits", required=True, help="bitstream to hide, e.g. 10110")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--message", help="secret text to compress (Unishox2) and hide")
+    src.add_argument("--bits", help="raw bitstream to hide instead, e.g. 10110")
     ap.add_argument("--model", default="mlx-community/SmolLM3-3B-8bit",
                     help="mlx-community model id (8-bit / less-peaky models give better constrained fluency)")
     ap.add_argument("--max-tokens", type=int, default=800)
@@ -418,13 +514,22 @@ def main() -> None:
                     help="allow the model to emit <think> reasoning (default off; thinking "
                          "models like SmolLM3/Qwen3 otherwise encode a reasoning block as garbage)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--key", default=None,
+                    help="secret key: shuffles the letter->bit alphabet per character; the "
+                         "recipient needs the same key to decode (omit for the fixed alphabet)")
     ap.add_argument("--quiet", action="store_true",
                     help="don't stream the cover text as it is generated (default: stream progress)")
     args = ap.parse_args()
 
-    bits = parse_bits(args.bits)
-    if not bits:
-        ap.error("--bits must contain at least one 0 or 1")
+    codec = None
+    if args.message is not None:
+        import payload_codec as codec
+        bits = codec.compress_to_bits(args.message)
+        print(f"[codec] {codec.ratio_report(args.message, bits)}")
+    else:
+        bits = parse_bits(args.bits)
+        if not bits:
+            ap.error("--bits must contain at least one 0 or 1")
 
     model, tokenizer = load(args.model)
     prompt = build_prompt(tokenizer, args.topic, args.think)
@@ -444,14 +549,21 @@ def main() -> None:
         rep_window=REP_WINDOW,
         no_repeat_ngram=NO_REPEAT_NGRAM,
         seed=args.seed,
+        key=args.key,
         stream=not args.quiet,
     )
 
     if args.quiet:                          # streaming already showed the text live
         print("\n" + "=" * 60)
         print(text)
-    ok = verify(text, bits)
-    encoding_summary(text, bits)
+    ok = verify(text, bits, args.key)
+    encoding_summary(text, bits, args.key)
+    if codec is not None and ok:
+        recovered = codec.decompress_from_bits(extract(text, args.key))
+        match = recovered == args.message
+        print(f"[codec] recovered message: {recovered!r}")
+        print(f"[codec] {'MATCH — message round-trips' if match else 'MISMATCH'}")
+        ok = match
     raise SystemExit(0 if ok else 1)
 
 

@@ -38,16 +38,18 @@ class Tok:
 tok = Tok(); V = len(VOCAB)
 
 
-def oracle(token_str, consumed, bits):
-    """Ground-truth (forbidden, bits_encoded) by direct simulation."""
+def oracle(token_str, consumed, char_pos, bits, key):
+    """Ground-truth (forbidden, bits_encoded) by direct simulation under `key`."""
     bi = consumed
-    for ch in token_str:
-        bk = s.char_bucket(ch)
-        if bk in (s.SKIP, s.SKIP_FREE):
+    for k, ch in enumerate(token_str):
+        r = s.char_role(ch, char_pos + k, key)
+        if r == s.FORBIDDEN:
+            return True, 0
+        if r in (s.SKIP, s.SKIP_FREE):
             continue
         if bi >= len(bits):
             break
-        if bk != bits[bi]:
+        if r != bits[bi]:
             return True, 0
         bi += 1
     return False, bi - consumed
@@ -55,22 +57,40 @@ def oracle(token_str, consumed, bits):
 
 def test_constrain_vs_oracle():
     mism = checks = 0
-    for trial in range(400):
-        bits = [random.Random(trial).randint(0, 1) for _ in range(random.Random(trial + 1).randint(1, 12))]
-        enc = s.Encoder(tok, bits, skip_penalty=1.0); enc._build(V)
-        for consumed in range(len(bits) + 1):
-            out, be = enc.constrain(consumed, np.zeros(V, np.float32))
-            for i in range(V):
-                checks += 1
-                of, obe = oracle(VOCAB[i], consumed, bits)
-                vf = bool(np.isneginf(out[i]))
-                if vf != of or (not of and int(be[i]) != obe):
-                    mism += 1
-                    if mism <= 8:
-                        print(f"  MISMATCH tok={VOCAB[i]!r} consumed={consumed} bits={bits} "
-                              f"vec=({vf},{int(be[i])}) oracle=({of},{obe})")
-    print(f"(1) constrain vs oracle: {checks} checks, mismatches={mism}")
+    for key in (None, "secret-key", "another"):
+        for trial in range(60):
+            bits = [random.Random(trial).randint(0, 1) for _ in range(random.Random(trial + 1).randint(1, 12))]
+            enc = s.Encoder(tok, bits, skip_penalty=1.0, key=key); enc._build(V)
+            for consumed in range(len(bits) + 1):
+                for char_pos in (0, 1, 7, 13):
+                    out, be = enc.constrain(consumed, char_pos, np.zeros(V, np.float32))
+                    for i in range(V):
+                        checks += 1
+                        of, obe = oracle(VOCAB[i], consumed, char_pos, bits, key)
+                        vf = bool(np.isneginf(out[i]))
+                        if vf != of or (not of and int(be[i]) != obe):
+                            mism += 1
+                            if mism <= 8:
+                                print(f"  MISMATCH key={key} tok={VOCAB[i]!r} consumed={consumed} "
+                                      f"pos={char_pos} bits={bits} vec=({vf},{int(be[i])}) oracle=({of},{obe})")
+    print(f"(1) constrain vs oracle (keyed): {checks} checks, mismatches={mism}")
     return mism == 0
+
+
+def test_keyed_roundtrip():
+    fails = wrong_key_differs = 0
+    for t in range(40):
+        bits = [random.Random(9000 + t).randint(0, 1) for _ in range(random.Random(t).randint(4, 10))]
+        key = f"key-{t}"
+        txt = quiet(s.steer_generate, make_model(t), tok, [VOCAB.index("the")], bits,
+                    max_tokens=400, temperature=0.7, num_candidates=8, fluency_weight=3.0,
+                    rollout_depth=1, tail_chars=0, key=key, seed=t)
+        if s.extract(txt, key)[:len(bits)] != bits:
+            fails += 1
+        if s.extract(txt, key + "X")[:len(bits)] != bits:   # wrong key -> garbage (usually)
+            wrong_key_differs += 1
+    print(f"(4) keyed round-trip x40: right-key-fails={fails}  wrong-key-differs={wrong_key_differs}/40")
+    return fails == 0
 
 
 def make_model(seed):
@@ -123,6 +143,7 @@ def test_cache_neutral():
 
 if __name__ == "__main__":
     print("bucket sample:", {c: s.char_bucket(c) for c in "the cat."})
-    results = [test_constrain_vs_oracle(), test_roundtrip(), test_cache_neutral()]
+    results = [test_constrain_vs_oracle(), test_roundtrip(), test_cache_neutral(),
+               test_keyed_roundtrip()]
     print("\nALL PASS" if all(results) else "\nFAILURES PRESENT")
     sys.exit(0 if all(results) else 1)
