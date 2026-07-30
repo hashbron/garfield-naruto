@@ -31,9 +31,17 @@ is what lets a maximal-density (stride-1) constraint still produce plausible tex
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import os
+import sys
 import unicodedata
 from functools import lru_cache
+
+# Quiet the backends: huggingface_hub and transformers read these when they are
+# imported, which `mlx_lm` does below — so they must be set first.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")   # "Fetching N files" bars
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")     # tokenizer warnings
 
 import numpy as np
 import mlx.core as mx
@@ -92,6 +100,36 @@ _LIDX = {c: i for i, c in enumerate(_ALPHA)}
 _LFREQ = np.array([_FREQ[c] for c in _ALPHA])               # frequency by letter index
 _BASE_ROLE = np.array([_BUCKET[c] for c in _ALPHA], dtype=np.int8)  # key=None assignment
 _BASE_ROLE.setflags(write=False)
+
+
+@contextlib.contextmanager
+def _muffled(active: bool):
+    """Send stdout/stderr to /dev/null while active, and yield the *real* stdout so
+    a caller can still write to it on purpose. That is what lets --clean stream the
+    cover text live while everything else stays suppressed."""
+    console = sys.stdout
+    if not active:
+        yield console
+        return
+    with open(os.devnull, "w") as null, \
+            contextlib.redirect_stdout(null), contextlib.redirect_stderr(null):
+        yield console
+
+
+BITS_PER_CHAR   = 0.3    # measured encoding density of the cover text
+CHARS_PER_TOKEN = 2.5    # constrained tokens run short; deliberately conservative
+TOKEN_HEADROOM  = 1.5    # slack, so a slow start cannot truncate the payload
+
+
+def token_budget(nbits: int, tail_chars: int) -> int:
+    """Token cap implied by the payload itself.
+
+    The encoder averages ~BITS_PER_CHAR bits per character, so `nbits` bits need
+    roughly nbits/BITS_PER_CHAR characters of cover text, plus the free tail. The
+    cap only has to be an upper bound — generation stops at EOS — so it errs high:
+    running short would truncate the payload and fail recovery."""
+    chars = nbits / BITS_PER_CHAR + tail_chars
+    return max(32, int(chars / CHARS_PER_TOKEN * TOKEN_HEADROOM))
 
 
 def parse_bits(s: str) -> list[int]:
@@ -355,11 +393,11 @@ def _lookahead(enc: Encoder, model, cache, consumed_after: int, char_pos_after: 
     return total / steps if steps else 0.0
 
 
-def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperature=0.8,
+def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=400, temperature=0.8,
                    skip_penalty=1.0, num_candidates=12, fluency_weight=3.0,
                    bit_bonus=2.0, rollout_depth=3, tail_chars=200, top_p=0.95,
                    freq_penalty=0.5, rep_window=64, no_repeat_ngram=3,
-                   seed=0, key=None, stream=False) -> str:
+                   seed=0, key=None, stream_to=None) -> str:
     """Stride-1 constrained decoding with a fluency-driven candidate search.
 
     Every character is a slot, so every step (until the payload is spent) is a
@@ -446,15 +484,15 @@ def steer_generate(model, tokenizer, prompt, bits, *, max_tokens=800, temperatur
         if choice in eos_ids:                            # natural end (payload already encoded);
             break                                        # don't append, so no EOS marker leaks in
         tokens.append(choice)
-        if stream:                                       # print each token the moment it's finalized
-            print(tokenizer.decode([choice]), end="", flush=True)
+        if stream_to is not None:                        # emit each token as it is finalized
+            print(tokenizer.decode([choice]), end="", flush=True, file=stream_to)
         if in_tail:
             tail += len(tokenizer.decode([choice]))
         logits = model(mx.array([[choice]]), cache=cache)[:, -1, :]
         mx.eval(logits)
 
-    if stream:
-        print()
+    if stream_to is not None:
+        print(file=stream_to)
     return tokenizer.decode(tokens[offset:])
 
 
@@ -481,62 +519,20 @@ def build_prompt(tokenizer, topic: str, think: bool):
         return tokenizer.apply_chat_template(messages, add_generation_prompt=True)
 
 
-def main() -> None:
-    # --- fixed tuning knobs (edit here; kept off the CLI) ---
-    TOP_P           = 0.95   # nucleus sampling cutoff
-    FREQ_PENALTY    = 0.5    # anti-repetition: penalty per recent token occurrence
-    REP_WINDOW      = 64     # anti-repetition: recent-token window
-    NO_REPEAT_NGRAM = 3      # anti-repetition: block repeating any n-gram of this size
+TOP_P           = 0.95   # nucleus sampling cutoff
+FREQ_PENALTY    = 0.5    # anti-repetition: penalty per recent token occurrence
+REP_WINDOW      = 64     # anti-repetition: recent-token window
+NO_REPEAT_NGRAM = 3      # anti-repetition: block repeating any n-gram of this size
 
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--topic", required=True, help="what the cover text is about")
-    src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--message", help="secret text to compress (Unishox2) and hide")
-    src.add_argument("--bits", help="raw bitstream to hide instead, e.g. 10110")
-    ap.add_argument("--model", default="mlx-community/SmolLM3-3B-8bit",
-                    help="mlx-community model id (8-bit / less-peaky models give better constrained fluency)")
-    ap.add_argument("--max-tokens", type=int, default=800)
-    ap.add_argument("--tail-chars", type=int, default=200,
-                    help="free cover text after the payload; past it, EOS is up-weighted to end naturally")
-    ap.add_argument("--temperature", type=float, default=0.8)
-    ap.add_argument("--skip-penalty", type=float, default=1.0,
-                    help="logit penalty per off-bucket-letter (SKIP) character")
-    ap.add_argument("--candidates", type=int, default=12,
-                    help="valid tokens trial-run per step (more = better search, slower)")
-    ap.add_argument("--fluency-weight", type=float, default=3.0,
-                    help="weight of the continuation-fluency score (0 = ignore fluency)")
-    ap.add_argument("--bit-bonus", type=float, default=2.0,
-                    help="score reward per bit a candidate encodes (raises density vs fluency)")
-    ap.add_argument("--rollout-depth", type=int, default=3,
-                    help="constrained steps looked ahead to judge fluency (0 disables lookahead)")
-    ap.add_argument("--think", action="store_true",
-                    help="allow the model to emit <think> reasoning (default off; thinking "
-                         "models like SmolLM3/Qwen3 otherwise encode a reasoning block as garbage)")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--key", default=None,
-                    help="secret key: shuffles the letter->bit alphabet per character; the "
-                         "recipient needs the same key to decode (omit for the fixed alphabet)")
-    ap.add_argument("--quiet", action="store_true",
-                    help="don't stream the cover text as it is generated (default: stream progress)")
-    args = ap.parse_args()
 
-    codec = None
-    if args.message is not None:
-        import payload_codec as codec
-        bits = codec.compress_to_bits(args.message)
-        print(f"[codec] {codec.ratio_report(args.message, bits)}")
-    else:
-        bits = parse_bits(args.bits)
-        if not bits:
-            ap.error("--bits must contain at least one 0 or 1")
-
+def _generate_and_verify(args, bits, codec, stream_to):
+    """Load, generate, and check the payload. Prints progress as it goes; the
+    caller decides whether that output is shown. Returns (cover_text, ok)."""
     model, tokenizer = load(args.model)
     prompt = build_prompt(tokenizer, args.topic, args.think)
-
     text = steer_generate(
         model, tokenizer, prompt, bits,
-        max_tokens=args.max_tokens,
+        max_tokens=token_budget(len(bits), args.tail_chars),
         tail_chars=args.tail_chars,
         temperature=args.temperature,
         skip_penalty=args.skip_penalty,
@@ -550,12 +546,8 @@ def main() -> None:
         no_repeat_ngram=NO_REPEAT_NGRAM,
         seed=args.seed,
         key=args.key,
-        stream=not args.quiet,
+        stream_to=stream_to,
     )
-
-    if args.quiet:                          # streaming already showed the text live
-        print("\n" + "=" * 60)
-        print(text)
     ok = verify(text, bits, args.key)
     encoding_summary(text, bits, args.key)
     if codec is not None and ok:
@@ -564,6 +556,64 @@ def main() -> None:
         print(f"[codec] recovered message: {recovered!r}")
         print(f"[codec] {'MATCH — message round-trips' if match else 'MISMATCH'}")
         ok = match
+    return text, ok
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--topic", required=True, help="what the cover text is about")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--message", help="secret text to compress (Unishox2) and hide")
+    src.add_argument("--bits", help="raw bitstream to hide instead, e.g. 10110")
+    ap.add_argument("--model", default="mlx-community/SmolLM3-3B-8bit",
+                    help="mlx-community model id (8-bit / less-peaky models give better constrained fluency)")
+    ap.add_argument("--tail-chars", type=int, default=200,
+                    help="free cover text after the payload; past it, EOS is up-weighted to end naturally")
+    ap.add_argument("--temperature", type=float, default=0.8)
+    ap.add_argument("--skip-penalty", type=float, default=1.0,
+                    help="logit penalty per off-bucket-letter (SKIP) character")
+    ap.add_argument("--candidates", type=int, default=3,
+                    help="valid tokens trial-run per step (more = better search, slower)")
+    ap.add_argument("--fluency-weight", type=float, default=3.0,
+                    help="weight of the continuation-fluency score (0 = ignore fluency)")
+    ap.add_argument("--bit-bonus", type=float, default=2.0,
+                    help="score reward per bit a candidate encodes (raises density vs fluency)")
+    ap.add_argument("--rollout-depth", type=int, default=4,
+                    help="constrained steps looked ahead to judge fluency (0 disables lookahead)")
+    ap.add_argument("--think", action="store_true",
+                    help="allow the model to emit <think> reasoning (default off; thinking "
+                         "models like SmolLM3/Qwen3 otherwise encode a reasoning block as garbage)")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--key", default=None,
+                    help="secret key: shuffles the letter->bit alphabet per character; the "
+                         "recipient needs the same key to decode (omit for the fixed alphabet)")
+    ap.add_argument("--clean", action="store_true",
+                    help="stream only the cover text — no progress, no verification. The "
+                         "exit code still reports whether the payload verified.")
+    args = ap.parse_args()
+
+    codec = None
+    if args.message is not None:
+        try:
+            import payload_codec as codec
+        except ModuleNotFoundError as exc:      # the Unishox2 wheel is an extra
+            raise SystemExit(
+                f"[codec] --message needs the Unishox2 codec, but {exc.name!r} is missing.\n"
+                f"  install it:  pip install unishox2-py3\n"
+                f"  or hide a raw bitstream instead with --bits") from None
+        bits = codec.compress_to_bits(args.message)
+        if not args.clean:
+            print(f"[codec] {codec.ratio_report(args.message, bits)}")
+    else:
+        bits = parse_bits(args.bits)
+        if not bits:
+            ap.error("--bits must contain at least one 0 or 1")
+
+    # The text always streams to the real console; --clean just silences
+    # everything else that would otherwise print around it.
+    with _muffled(args.clean) as console:
+        _, ok = _generate_and_verify(args, bits, codec, console)
     raise SystemExit(0 if ok else 1)
 
 
