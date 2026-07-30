@@ -53,6 +53,13 @@ FORBIDDEN = 4           # non-whitelisted non-alpha (control / combining / exoti
 BIT_BUCKETS = (0, 1)    # roles that actually carry a bit
 EOS_RAMP = 2.0          # per-char EOS logit boost once past the tail budget (ends the tail)
 
+# Tokens longer than this are marked junk and never emitted. The constraint matrix
+# is (vocab x longest token), so one 128-character token — the vocab's longest are
+# whitespace runs and '//------' rules — made 95% of that rectangle padding and
+# cost 22x the necessary work per step. Capping at 24 drops 0.4% of the vocab,
+# almost all of it formatting artefacts unwanted in prose anyway.
+MAX_TOKEN_CHARS = 24
+
 # `char_group` codes: 0-25 are the 26 letters (by index); the rest tag fixed,
 # non-shuffled characters.
 G_PUNCT = 26            # whitelisted punctuation  -> SKIP_FREE (fixed, free)
@@ -254,13 +261,16 @@ class Encoder:
         rows = []
         for i in range(V):
             gs = [char_group(c) for c in self.tok.decode([i])]
+            if len(gs) > MAX_TOKEN_CHARS:      # never emitted, so truncating is safe
+                gs = gs[:MAX_TOKEN_CHARS]      # and keeps the whole matrix narrow
+                self.junk[i] = True
             rows.append(gs)
             # A FORBIDDEN *role* does not block a token by itself — only this mask
             # does — so every never-emit class has to be collected here. Non-Latin
             # letters (CJK/Greek/Cyrillic) were previously a penalized-but-always-
             # legal SKIP, i.e. a guaranteed escape hatch that got used once pricing
             # closed the space and punctuation ones.
-            self.junk[i] = (G_JUNK in gs) or (G_NONLATIN in gs)
+            self.junk[i] |= (G_JUNK in gs) or (G_NONLATIN in gs)
             if len(gs) > max_c:
                 max_c = len(gs)
         CHR = np.full((V, max_c), -1, dtype=np.int16)   # char_group code per char, -1 = padding
@@ -268,17 +278,21 @@ class Encoder:
             if gs:
                 CHR[i, :len(gs)] = gs
         self.CHR, self.max_c = CHR, max_c
+        # Static per-character facts, computed once instead of on every step: the
+        # comparisons below used to run over the full matrix each token.
+        self._letter_at = (CHR >= 0) & (CHR < 26)
+        self._clipped = np.clip(CHR, 0, 25)
+        self._fixed = np.where(CHR == G_PUNCT, np.int8(SKIP_FREE),
+                      np.where(CHR == -1, np.int8(-1), np.int8(FORBIDDEN)))
 
     def _roles(self, char_pos: int):
         """(V, max_c) live role of each token character at the given char position."""
         E = self.max_c
         rmap = np.stack([_letter_roles(self.key, char_pos + k) for k in range(E)])   # (E, 26)
-        role = rmap[np.arange(E)[None, :], np.clip(self.CHR, 0, 25)]  # letters -> bit0/bit1/SKIP
-        role = np.where(self.CHR == G_PUNCT, SKIP_FREE, role)        # punctuation: free skip
-        role = np.where(self.CHR == G_NONLATIN, FORBIDDEN, role)     # non-Latin letter: never emit
-        role = np.where(self.CHR == G_JUNK, FORBIDDEN, role)         # junk: never emitted
-        role = np.where(self.CHR == -1, -1, role)                    # padding
-        return role
+        gathered = rmap[np.arange(E)[None, :], self._clipped]        # letters -> bit0/bit1/SKIP
+        # Everything that is not a letter has a role fixed at build time, so one
+        # select against the precomputed table replaces four full-matrix compares.
+        return np.where(self._letter_at, gathered, self._fixed)
 
     def token_bits(self, token: int, char_pos: int, consumed: int) -> int:
         """How many payload bits `token` encodes if placed at `char_pos` given `consumed`."""

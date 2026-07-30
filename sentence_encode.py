@@ -1,36 +1,40 @@
 #!/usr/bin/env python3
 """
-sentence_encode.py — accept or reject a sentence at a time.
+sentence_encode.py — steganographic encoding, one sentence at a time.
 
-`resampling_encode.py` scores whole paragraphs: one bad clause discards ~200 good
-characters, and with 20 samples the odds that *every* sentence in some sample is
-clean fall off fast. `simple_encode.py` searches per token, which has no unit of
-meaning at all and (measured) collapses to a near-argmax.
+Hides a bitstream in fluent cover text by constraining which characters the model
+may emit: at each character position a character either carries the next payload
+bit, or skips. The constraint machinery (keyed alphabet, vectorised whole-vocab
+masking, payload framing) lives in simple_encode.py; this file adds the control
+loop around it.
 
-A sentence is the natural unit. Here generation runs until a terminator, the
-finished sentence is scored, and if it fails it is rolled back — KV cache, token
-list, and payload position — and retried from the same state with fresh sampling.
-Accepted sentences are never revisited, so the cost is bounded per sentence rather
-than per paragraph.
+A sentence is the unit of acceptance. Generation runs to a terminator, the finished
+sentence is scored, and a bad one is rolled back — KV cache, token list and payload
+position — then retried from the same state with fresh sampling. Accepted sentences
+are never revisited, so cost is bounded per sentence rather than per paragraph, and
+one garbled clause no longer discards the good text around it.
 
-Two properties make this cheap:
+Scoring is free: per-token excess surprise (NLL - entropy) comes from logits already
+computed during generation, so judging a sentence costs no extra forward pass. Three
+signals decide acceptance, each aimed at a failure mode seen in practice:
 
-  * scoring is free. Per-token excess surprise (NLL - entropy) is computed from the
-    logits already in hand at each step, so a sentence costs no extra forward pass
-    to evaluate;
-  * failure is detected early. A sentence is abandoned the moment it exceeds the
-    shock budget, rather than being finished and then thrown away.
+    shocks   tokens far above the model's own expectation      (garbled text)
+    coined   words absent from the system dictionary           (invented words)
+    caps     capitalised-word rate                             (title-register drift)
 
-    python sentence_encode.py --topic "the sea" --bits 10110100 --key demo
+Known limit: retries inherit the prefix, so a sentence-level loop cannot escape a
+bad *opening*. When the accept rate collapses (nothing accepted over many attempts)
+the sample is usually unsalvageable and is better restarted with another seed.
+
+    python sentence_encode.py --topic "the sea" --message "meet at dawn" --key k
+    python sentence_encode.py --topic "the sea" --bits 10110100 --key k --clean
 """
-
 from __future__ import annotations
 
 import argparse
 import sys
 
 import simple_encode as se          # sets the backend-quieting env vars on import
-import resampling_encode as re_     # metrics: coined words, SHOCK_NATS
 
 import numpy as np
 import mlx.core as mx
@@ -38,6 +42,83 @@ from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 
 TERMINATORS = ".!?"
+DICT_PATH = "/usr/share/dict/words"
+
+# A token this far above the model's own expectation reads as a jolt. Genuine
+# text from this model tops out near 3 nats, so 5 is comfortably outside it.
+SHOCK_NATS = 5.0
+
+
+def load_vocab() -> set[str]:
+    try:
+        with open(DICT_PATH, encoding="utf-8", errors="ignore") as fh:
+            return {w.strip().lower() for w in fh if w.strip()}
+    except OSError:
+        return set()
+
+
+def _known(w: str, vocab: set[str]) -> bool:
+    """Dictionary lookup that tolerates inflection. /usr/share/dict/words is web2,
+    a lemma-only list with no plurals or verb forms — without this, ordinary words
+    like "waves" and "painted" read as coined and the metric inverts (measured:
+    genuine text scored a *worse* coined rate than stego text)."""
+    if w in vocab:
+        return True
+    for suf, adds in (("s", [""]), ("es", ["", "e"]), ("ed", ["", "e"]),
+                      ("ing", ["", "e"]), ("ly", [""]), ("er", ["", "e"]),
+                      ("est", ["", "e"]), ("d", [""]), ("n", [""])):
+        if w.endswith(suf) and len(w) > len(suf) + 2:
+            stem = w[:-len(suf)]
+            if any(stem + a in vocab for a in adds):
+                return True
+            if len(stem) > 2 and stem[-1] == stem[-2] and stem[:-1] in vocab:
+                return True         # doubled consonant: "shimmering" -> "shimmer"
+            if stem.endswith("i") and stem[:-1] + "y" in vocab:
+                return True         # "carried" -> "carry"
+    return False
+
+
+def coined_words(text: str, vocab: set[str]) -> list[str]:
+    """Words the dictionary does not know — the artifact a reader actually notices
+    ("Serbucare", "fortiye-fife"). Hyphenated and apostrophe forms are checked
+    part-by-part; short fragments are ignored as noise. Proper nouns count as
+    coined, which is why the genuine baseline is measured the same way."""
+    if not vocab:
+        return []
+    out = []
+    for raw in text.split():
+        cleaned = "".join(c for c in raw.lower() if c.isalpha() or c in "'-")
+        parts = [p for p in cleaned.replace("'", "-").split("-") if len(p) > 2]
+        if parts and not all(_known(p, vocab) for p in parts):
+            out.append(raw)
+    return out
+
+
+def register_oddity(text: str) -> float:
+    """Fraction of non-initial words that are Capitalized — a register check.
+
+    Word-salad often passes the dictionary test (every word is real) but arrives as
+    a title: "Pacific Maiden Awake on a Quiet Shore". Ordinary prose sits near the
+    proper-noun rate; a heading sits near 1.0."""
+    words = [w for w in text.split() if w[:1].isalpha()]
+    if len(words) < 4:
+        return 0.0
+    return sum(w[:1].isupper() for w in words[1:]) / (len(words) - 1)
+
+
+def payload_span(text: str, nbits: int, key) -> int | None:
+    """Characters consumed to carry the whole payload, or None if it never fit.
+    Density must be measured over this span — the free tail after it carries no
+    payload and dividing by the whole text roughly halves the apparent density."""
+    n = 0
+    for i, ch in enumerate(text):
+        if se.char_role(ch, i, key) in se.BIT_BUCKETS:
+            n += 1
+            if n >= nbits:
+                return i + 1
+    return None
+
+
 
 
 def _sentence_done(text: str) -> bool:
@@ -143,9 +224,9 @@ def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
             break
 
     exa = np.array(excesses) if excesses else np.array([0.0])
-    coined = len(re_.coined_words(sent, _VOCAB))
-    caps = re_.register_oddity(sent)
-    shocks = int((exa > re_.SHOCK_NATS).sum())
+    coined = len(coined_words(sent, _VOCAB))
+    caps = register_oddity(sent)
+    shocks = int((exa > SHOCK_NATS).sum())
     complete = complete or hit_eos
     return {"tokens": new, "text": sent, "consumed": cur, "eos": hit_eos,
             "complete": complete,
@@ -166,7 +247,7 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
     """Encode `bits`, accepting one sentence at a time."""
     global _VOCAB
     if not _VOCAB:
-        _VOCAB = re_.load_vocab()
+        _VOCAB = load_vocab()
     budget = budget or Budget()
     enc = se.Encoder(tok, bits, skip_penalty, key)
     rng = np.random.default_rng(seed)
@@ -277,7 +358,7 @@ def _generate_and_verify(args, bits, codec, stream_to=None):
         print(text.strip())
     ok = se.verify(text, bits, args.key)
     se.encoding_summary(text, bits, args.key)
-    span = re_.payload_span(text, len(bits), args.key)
+    span = payload_span(text, len(bits), args.key)
     if span:
         print(f"[stego] payload region: {len(bits) / span:.4f} bits/char "
               f"({span} of {len(text)} chars carry it; the rest is free tail)")
