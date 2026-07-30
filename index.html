@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stream Local Command Output</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <div class="fixed-top">
+  <h1>Garfield-Naruto Encoder</h1>
+  <div class="select-bar">
+    <a class="selection" href="index_5.html#encode_section">Encode</a>
+    <a class="selection" href="index_5.html#decode_section">Decode</a>
+    <a class="selection" href="index_5.html#how_it_works_section">How it works</a>
+    <a class="selection" href="index_5.html#security_section">Security</a>
+    <a class="selection" href="index_5.html#download_section">Links</a>
+  </div>
+</div>
+
+  <div class="content-column">
+
+    <h2 id="encode_section">Encode a message</h2>
+    <p>Enter your secret message below and G-N Encoder will hide it in LLM slop. Topic allows you to choose what the slop is about and Key is a random seed for the encoding (think of it like a password required for decoding).</p>
+      <p class="input_label">Message:<input type="text" size=75 placeholder="Enter your secret message here." id="fbitstream" name="Bitstream"><br></p>
+      <p class="input_label">Topic: <input type="text" size=50 placeholder="Choose a topic for the LLM slop." id="ftopic" name="Topic"><br></p>
+      <p class="input_label">Key:<input type="text" placeholder="Pick a secret key." id="fkey" name="Key"><br></p>
+    <div class="button_holder">
+    <button id="startBtn">Begin Encoding</button>
+    <button id="stopBtn" disabled>Stop</button>
+    </div>
+     <p class="status">
+      Requires the local helper server (<code>server.js</code>) running at
+      <code>http://localhost:3000</code>. Currently runs whatever command is
+      set in <code>COMMAND</code> inside <code>server.js</code>.
+    </p>
+    <p class="status" id="statusText"></p>
+
+    <pre id="output">Output will stream here…</pre>
+
+    <h2 id="decode_section">Decode a message</h2>
+
+    <button">DECODE</button>
+
+    <h2 id="how_it_works_section">How it works</h2>
+    <p>The first step of our encoding takes the secret message, converts it to a bistring, and then compresses it using <a href="https://pypi.org/project/unishox2-py3/">unishox2.</a></p>
+
+    <p>From there, the secret message is encoded in the LLM text using the individual characters. Based on the key, we partition the set of all characters into three subsets. One set encodes a 0, another a 1, and the third encodes a skip. The partitioning is done using the frequency of different characters in English language text.</p>
+    <div class="table_holder">
+    <table>
+    <thead>
+        <tr>
+            <th colspan="8">English Letter Frequency (%)</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>E<br>12.70</td>
+            <td>T<br>9.06</td>
+            <td>A<br>8.17</td>
+            <td>O<br>7.51</td>
+            <td>I<br>6.97</td>
+            <td>N<br>6.75</td>
+            <td>S<br>6.33</td>
+            <td>H<br>6.09</td>
+        </tr>
+        <tr>
+            <td>R<br>5.99</td>
+            <td>D<br>4.25</td>
+            <td>L<br>4.03</td>
+            <td>C<br>2.78</td>
+            <td>U<br>2.76</td>
+            <td>M<br>2.41</td>
+            <td>W<br>2.36</td>
+            <td>F<br>2.23</td>
+        </tr>
+        <tr>
+            <td>G<br>2.02</td>
+            <td>Y<br>1.97</td>
+            <td>P<br>1.93</td>
+            <td>B<br>1.49</td>
+            <td>V<br>0.98</td>
+            <td>K<br>0.77</td>
+            <td>J<br>0.15</td>
+            <td>X<br>0.15</td>
+        </tr>
+        <tr>
+            <td>Q<br>0.10</td>
+            <td>Z<br>0.07</td>
+            <td></td>
+            <td></td>
+            <td></td>
+            <td></td>
+            <td></td>
+            <td></td>
+        </tr>
+    </tbody>
+</table>
+</div>
+
+<p></p>
+<p></p>
+<p></p>
+
+<div class="partitions">
+    <div class="group group1">
+        <h3>Encodes 0</h3>
+        <div class="letters">E C Y W R K N</div>
+        <div class="prob">≈ 37.4%</div>
+    </div>
+
+    <div class="group group2">
+        <h3>Encodes 1</h3>
+        <div class="letters">I L B H U V T G</div>
+        <div class="prob">≈ 36.1%</div>
+    </div>
+
+    <div class="group group3">
+        <h3>Encodes Skip</h3>
+        <div class="letters">Z J A Q P O X S F M D</div>
+        <div class="prob">≈ 26.5%</div>
+    </div>
+</div>
+
+    <p>The LLM generates text in response to the topic by creating a set of tokens and choosing the next most likely token. At each one of these inference steps, our algorithm removes any tokens that would encode an incorrect bit. What remains are the tokens that encode either the correct bit or a skip. Hyperparameters are available to prioritize encoding bits or penalize skips. Tuning these hyperparameters adjusts the tradeoff between encoding density and human indistinguishability.</p>
+
+    <p>When the LLM has finished encoding all the desired bits, it proceeds to generate text as normal, choosing the most likely tokens independant of our character partioning.</p>
+
+    <h2 id="security_section">Security</h2>
+    
+    <h2 id="download_section">Links</h2>
+
+    <p>This is placeholder documentation describing a fictional installation process for an example application. Begin by downloading the latest binary from the project's imaginary release page and saving it to a convenient location on your computer. Once the download has completed, verify that the file appears in your downloads folder before proceeding to the next step.</p>
+
+    <p>Next, make the downloaded binary executable using the appropriate command for your operating system. After granting execute permissions, move the binary to a directory that is included in your system's PATH so it can be run from any terminal window. These instructions are entirely fictional and are intended only as sample text for documentation layouts.</p>
+
+    <p>Finally, confirm the installation by running the example application's version command. If the placeholder version information is displayed, you can assume the fictional installation was successful. If any pretend errors occur, consult the equally fictional troubleshooting guide or repeat the previous steps to ensure the example binary was installed correctly.</p>
+
+    <h2>Acknowledgements</h2>
+
+    <p>This project was a team effort built at the Community Privacy Residency.</p>
+
+  </div>
+  <script src="script.js"></script>
+<!--   <script type="module">
+    import { decodeMessage } from "decode.js";
+    import * as usx from 'unishox2.js';
+</script> -->
+
+
+</body>
+</html>
