@@ -136,21 +136,35 @@ def parse_bits(s: str) -> list[int]:
     return [1 if c == "1" else 0 for c in s if c in "01"]
 
 
+def _letter_order(key, pos: int) -> list[int]:
+    """Keyed order in which the 26 letters claim their roles.
+
+    Uses SHA-256 alone — no numpy RNG — so JavaScript can derive the identical
+    order (see stego_decode.js). numpy's PCG64 is not reasonably reproducible
+    outside numpy, which would have made the browser decoder a re-implementation
+    of a library internal rather than of a specification.
+
+    26 sort keys of 4 bytes each; ties broken by letter index so the order is
+    fully determined."""
+    stream = b"".join(hashlib.sha256(f"{key}|{pos}|{b}".encode()).digest()
+                      for b in range(4))
+    return [i for _, i in sorted(
+        (int.from_bytes(stream[i * 4:i * 4 + 4], "big"), i) for i in range(26))]
+
+
 @lru_cache(maxsize=1 << 18)
 def _letter_roles(key, pos: int) -> np.ndarray:
     """Keyed assignment of all 26 letters to roles {bit0=0, bit1=1, SKIP=2} at
     character position `pos`. This reshuffles *membership* every position (not just
     relabels three fixed groups), so no fixed letter clustering survives — over
-    text each letter lands in each role about equally. A greedy pass in a keyed
+    text each letter lands in each role about equally. A greedy pass in the keyed
     order fills the currently lightest role, keeping each role ~1/3 of letter
     frequency for fluency. key=None returns the fixed base assignment."""
     if key is None:
         return _BASE_ROLE
-    seed = int.from_bytes(hashlib.sha256(f"{key}|{pos}".encode()).digest()[:8], "big")
-    order = np.random.default_rng(seed).permutation(26)
     sums = [0.0, 0.0, 0.0]
     role = np.empty(26, dtype=np.int8)
-    for L in order:
+    for L in _letter_order(key, pos):
         r = int(np.argmin(sums))
         role[L] = r
         sums[r] += _LFREQ[L]

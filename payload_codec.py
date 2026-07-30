@@ -64,15 +64,38 @@ def compress_to_bits(message: str) -> list[int]:
     return bytes_to_bits(frame)
 
 
+# Unishox2's `original_size` argument is the size of the C output buffer, not a
+# format field. Overestimating is harmless; UNDERestimating overruns the buffer and
+# corrupts the heap (measured: a 143-char message decompressed with size=50 dies on
+# SIGTRAP, size=5 on SIGSEGV). The header here is recovered from cover text, so a
+# wrong key or a corrupted paragraph supplies arbitrary values — which makes a
+# crash reachable from ordinary user input. Size the buffer defensively instead.
+# A fixed generous buffer beats deriving one from the header: the header is the
+# very thing that may be corrupt, so any formula over it can still under-size.
+# Payloads here are at most a few hundred bytes, so 1 MiB is free insurance.
+_DECOMP_BUF = 1 << 20
+
+
 def decompress_from_bits(bits: list[int]) -> str:
-    """Inverse of compress_to_bits; trailing stego 'free tail' bits are ignored."""
+    """Inverse of compress_to_bits; trailing stego 'free tail' bits are ignored.
+
+    Raises ValueError on a malformed frame rather than trusting it — the frame
+    comes out of the cover text, so it is untrusted input."""
     data = bits_to_bytes(bits)
-    original_size, i = _read_varint(data, 0)
-    comp_len, i = _read_varint(data, i)
+    try:
+        original_size, i = _read_varint(data, 0)
+        comp_len, i = _read_varint(data, i)
+    except IndexError:
+        raise ValueError("bitstream too short to hold a payload header") from None
     compressed = bytes(data[i:i + comp_len])
     if len(compressed) < comp_len:
-        raise ValueError("bitstream truncated: not enough bits for the compressed payload")
-    return unishox2.decompress(compressed, original_size)
+        raise ValueError(
+            f"bitstream truncated: header wants {comp_len} compressed bytes, "
+            f"only {len(compressed)} present (wrong key, or the cover text was edited)")
+    if original_size > _DECOMP_BUF:
+        raise ValueError(f"header declares {original_size} chars, above the "
+                         f"{_DECOMP_BUF}-byte decompression limit")
+    return unishox2.decompress(compressed, _DECOMP_BUF)
 
 
 def ratio_report(message: str, bits: list[int]) -> str:
