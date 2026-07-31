@@ -228,10 +228,15 @@ function decodeMessage(text, key) {
     throw new Error("unishox2.js did not load, so the message cannot be decompressed");
   }
   const out = unishox2_decompress_simple(compressed, compressed.length);
-  if (out.length !== originalSize) {
+  // The frame's size field is Python's, i.e. a UTF-8 BYTE count, while a JS
+  // string's .length counts UTF-16 code units. Those agree only for ASCII, so
+  // comparing them directly rejects perfectly good decodes of any message
+  // containing a curly quote, an accent, a dash or an emoji. Measure the same
+  // quantity on both sides before deciding anything is wrong.
+  if (new TextEncoder().encode(out).length !== originalSize) {
     throw new Error(
-      `unishox2 length mismatch: frame declares ${originalSize} chars, ` +
-      `decompressed ${out.length}`
+      `unishox2 length mismatch: frame declares ${originalSize} bytes, ` +
+      `decompressed ${new TextEncoder().encode(out).length}`
     );
   }
   return out;
@@ -324,7 +329,7 @@ stopBtn.addEventListener('click', async () => {
 decodeBtn.addEventListener('click', () => {
   // Decoding runs entirely in the browser — no server needed.
   const encoded = document.getElementById('fencoded').value;
-  const key = document.getElementById('fkey').value;
+  const key = document.getElementById('fdecodekey').value;
 
   try {
     decodeOutput.textContent = decodeMessage(encoded, key);

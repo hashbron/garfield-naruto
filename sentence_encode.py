@@ -160,8 +160,7 @@ class Budget:
 
 def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
                    rng, temperature, top_p, bit_bonus, eos_ids, budget,
-                   skip_penalty, max_chars, in_tail, tail_chars, tail_so_far,
-                   allow_abort=True):
+                   skip_penalty, max_chars, allow_abort=True):
     """Generate one sentence. Returns a dict describing it; the caller decides
     whether to keep it. Leaves the cache advanced by `n_tokens` either way."""
     new, excesses, cur, hit_eos, complete = [], [], consumed, False, False
@@ -169,22 +168,14 @@ def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
     while True:
         raw = se._vec(logits)
         lse = se._logsumexp(raw)
-        if in_tail:
-            base = raw.copy()
-            base[enc.junk] = -np.inf
-            base = se._antirepeat(base, tokens[offset:] + new, freq_penalty=0.5,
-                                  window=64, no_repeat_ngram=3)
-            if tail_so_far + len(sent) >= tail_chars:
-                for e in eos_ids:
-                    base[e] += se.EOS_RAMP
-        else:
-            char_pos = len(tok.decode(tokens[offset:])) + len(sent)
-            masked, bits_enc = enc.constrain(cur, char_pos, raw)
+        char_pos = len(tok.decode(tokens[offset:])) + len(sent)
+        masked, bits_enc = enc.constrain(cur, char_pos, raw)
+        if cur < enc.nbits:                    # never stop mid-payload
             for e in eos_ids:
                 masked[e] = -np.inf
-            base = se._antirepeat(masked.copy(), tokens[offset:] + new,
-                                  freq_penalty=0.5, window=64, no_repeat_ngram=3)
-            base = base + bit_bonus * bits_enc
+        base = se._antirepeat(masked.copy(), tokens[offset:] + new,
+                              freq_penalty=0.5, window=64, no_repeat_ngram=3)
+        base = base + bit_bonus * bits_enc
         if not np.isfinite(base).any():
             break
         p = np.exp(raw - lse)
@@ -205,8 +196,7 @@ def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
         s = tok.decode([choice])
         new.append(choice)
         sent += s
-        if not in_tail:
-            cur += int(bits_enc[choice])
+        cur += int(bits_enc[choice])
         clog = model(mx.array([[choice]]), cache=cache)[:, -1, :]
         mx.eval(clog)
         logits = clog
@@ -241,7 +231,7 @@ _VOCAB: set[str] = set()
 
 
 def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
-             top_p=0.95, bit_bonus=1.0, skip_penalty=1.0, tail_chars=60,
+             top_p=0.95, bit_bonus=1.0, skip_penalty=1.0,
              max_sentence_chars=200, budget=None, seed=0, verbose=False,
              stream_to=None):
     """Encode `bits`, accepting one sentence at a time."""
@@ -263,12 +253,9 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
         if e < enc.junk.size:
             enc.junk[e] = False
 
-    consumed, tail = 0, 0
+    consumed = 0
     stats = {"accepted": 0, "rejected": 0, "fallback": 0}
-    while True:
-        in_tail = consumed >= enc.nbits
-        if in_tail and tail >= tail_chars:
-            break
+    while consumed < enc.nbits:
         best = None
         def attempt(allow_abort=True):
             return _grow_sentence(
@@ -276,7 +263,6 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
                 consumed=consumed, rng=rng, temperature=temperature, top_p=top_p,
                 bit_bonus=bit_bonus, eos_ids=eos_ids, budget=budget,
                 skip_penalty=skip_penalty, max_chars=max_sentence_chars,
-                in_tail=in_tail, tail_chars=tail_chars, tail_so_far=tail,
                 allow_abort=allow_abort)
 
         for _ in range(attempts):
@@ -329,8 +315,6 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
         if stream_to is not None:       # committed — emit it now, not at the end
             print(cand["text"], end="", flush=True, file=stream_to)
         tokens.extend(cand["tokens"])
-        if in_tail:
-            tail += len(cand["text"])
         consumed = cand["consumed"]
         logits = cand["logits"]
         if cand["eos"] or not cand["n"]:
@@ -349,7 +333,7 @@ def _generate_and_verify(args, bits, codec, stream_to=None):
     text, stats = generate(
         model, tok, prompt, bits, key=args.key, attempts=args.attempts,
         temperature=args.temperature, bit_bonus=args.bit_bonus,
-        skip_penalty=args.skip_penalty, tail_chars=args.tail_chars,
+        skip_penalty=args.skip_penalty,
         seed=args.seed, verbose=True, stream_to=stream_to,
         budget=Budget(max_shocks=args.max_shocks, max_coined=args.max_coined,
                       max_caps=args.max_caps))
@@ -361,7 +345,7 @@ def _generate_and_verify(args, bits, codec, stream_to=None):
     span = payload_span(text, len(bits), args.key)
     if span:
         print(f"[stego] payload region: {len(bits) / span:.4f} bits/char "
-              f"({span} of {len(text)} chars carry it; the rest is free tail)")
+              f"({span} of {len(text)} chars carry it; the rest finishes the sentence)")
     print(f"[stego] sentences: {stats['accepted']} accepted, "
           f"{stats['rejected']} rejected, {stats['fallback']} fallback")
     if codec is not None and ok:
@@ -383,8 +367,6 @@ def main() -> None:
     ap.add_argument("--model", default="mlx-community/SmolLM3-3B-8bit",
                     help="mlx-community model id (8-bit / less-peaky models give "
                          "better constrained fluency)")
-    ap.add_argument("--tail-chars", type=int, default=60,
-                    help="free cover text after the payload; past it, EOS is up-weighted")
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--skip-penalty", type=float, default=1.0,
                     help="logit penalty per off-bucket-letter (SKIP) character")
