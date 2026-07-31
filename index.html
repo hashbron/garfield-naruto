@@ -146,11 +146,11 @@
     <p>This project was a team effort built at the Community Privacy Residency.</p>
 
   </div>
-  <!-- unishox2.js is a classic script: it only assigns to module.exports when one
-       exists, so in the browser its functions land on window, where script.js
-       picks them up. script.js is a module so it can import from decode.js. -->
+  <!-- unishox2.js first: script.js calls its decompressor, and as a classic
+       script it only assigns to module.exports when one exists, so here its
+       functions become globals. -->
   <script src="unishox2.js"></script>
-  <script type="module" src="script.js"></script>
+  <script src="script.js"></script>
 
 
 </body>
