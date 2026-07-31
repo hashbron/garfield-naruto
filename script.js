@@ -1,7 +1,11 @@
+import { decodeMessage } from './decode.js';
+
 const startBtn = document.getElementById('startBtn');
 const stopBtn = document.getElementById('stopBtn');
 const output = document.getElementById('output');
 const statusText = document.getElementById('statusText');
+const decodeBtn = document.getElementById('decodeBtn');
+const decodeOutput = document.getElementById('decodeOutput');
 
 let eventSource = null;
 
@@ -74,4 +78,20 @@ stopBtn.addEventListener('click', async () => {
     // Server may already be down; ignore.
   }
   stopStream();
+});
+
+decodeBtn.addEventListener('click', () => {
+  // Decoding runs entirely in the browser — no server needed.
+  const encoded = document.getElementById('fencoded').value;
+  const key = document.getElementById('fkey').value;
+
+  // unishox2.js was loaded as a classic script, so its functions are on window,
+  // which is all decodeMessage needs from the module.
+  try {
+    decodeOutput.textContent = decodeMessage(encoded, key, window);
+  } catch (err) {
+    // A wrong key produces arbitrary bits, so a failed decode is expected here
+    // rather than exceptional; show why instead of failing silently.
+    decodeOutput.textContent = `Could not decode: ${err.message}`;
+  }
 });

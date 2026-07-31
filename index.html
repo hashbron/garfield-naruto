@@ -40,7 +40,12 @@
 
     <h2 id="decode_section">Decode a message</h2>
 
-    <button">DECODE</button>
+      <p class="input_label">Encoded text:<input type="text" size=75 placeholder="Paste the encoded text here." id="fencoded" name="Encoded"><br></p>
+    <div class="button_holder">
+    <button id="decodeBtn">DECODE</button>
+    </div>
+
+    <pre id="decodeOutput">Decoded message will appear here…</pre>
 
     <h2 id="how_it_works_section">How it works</h2>
     <p>The first step of our encoding takes the secret message, converts it to a bistring, and then compresses it using <a href="https://pypi.org/project/unishox2-py3/">unishox2.</a></p>
@@ -141,11 +146,11 @@
     <p>This project was a team effort built at the Community Privacy Residency.</p>
 
   </div>
-  <script src="script.js"></script>
-<!--   <script type="module">
-    import { decodeMessage } from "decode.js";
-    import * as usx from 'unishox2.js';
-</script> -->
+  <!-- unishox2.js is a classic script: it only assigns to module.exports when one
+       exists, so in the browser its functions land on window, where script.js
+       picks them up. script.js is a module so it can import from decode.js. -->
+  <script src="unishox2.js"></script>
+  <script type="module" src="script.js"></script>
 
 
 </body>
