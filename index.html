@@ -10,11 +10,11 @@
   <div class="fixed-top">
   <h1>Garfield-Naruto Encoder</h1>
   <div class="select-bar">
-    <a class="selection" href="index_5.html#encode_section">Encode</a>
-    <a class="selection" href="index_5.html#decode_section">Decode</a>
-    <a class="selection" href="index_5.html#how_it_works_section">How it works</a>
-    <a class="selection" href="index_5.html#security_section">Security</a>
-    <a class="selection" href="index_5.html#download_section">Links</a>
+    <a class="selection" href="index.html#encode_section">Encode</a>
+    <a class="selection" href="index.html#decode_section">Decode</a>
+    <a class="selection" href="index.html#how_it_works_section">How it works</a>
+    <a class="selection" href="index.html#security_section">Security</a>
+    <a class="selection" href="index.html#download_section">Links</a>
   </div>
 </div>
 
@@ -24,7 +24,7 @@
     <p>Enter your secret message below and G-N Encoder will hide it in LLM slop. Topic allows you to choose what the slop is about and Key is a random seed for the encoding (think of it like a password required for decoding).</p>
       <p class="input_label">Message:<input type="text" size=75 placeholder="Enter your secret message here." id="fbitstream" name="Bitstream"><br></p>
       <p class="input_label">Topic: <input type="text" size=50 placeholder="Choose a topic for the LLM slop." id="ftopic" name="Topic"><br></p>
-      <p class="input_label">Key:<input type="text" placeholder="Pick a secret key." id="fkey" name="Key"><br></p>
+      <p class="input_label">Key:<input type="text" placeholder="Pick a secret key." id="fencodekey" name="Key"><br></p>
     <div class="button_holder">
     <button id="startBtn">Begin Encoding</button>
     <button id="stopBtn" disabled>Stop</button>
@@ -41,7 +41,7 @@
     <h2 id="decode_section">Decode a message</h2>
 
       <p class="input_label">Encoded text:<input type="text" size=75 placeholder="Paste the encoded text here." id="fencoded" name="Encoded"><br></p>
-      <p class="input_label">Key:<input type="text" placeholder="The key it was encoded with." id="fdecodekey" name="DecodeKey"><br></p>
+      <p class="input_label">Key:<input type="text" placeholder="Pick a secret key." id="fdecodekey" name="DecodeKey"><br></p>
     <div class="button_holder">
     <button id="decodeBtn">DECODE</button>
     </div>
@@ -147,9 +147,9 @@
     <p>This project was a team effort built at the Community Privacy Residency.</p>
 
   </div>
-  <!-- unishox2.js first: script.js calls its decompressor, and as a classic
-       script it only assigns to module.exports when one exists, so here its
-       functions become globals. -->
+  <!-- unishox2.js is a classic script: it only assigns to module.exports when one
+       exists, so in the browser its functions land on window, where script.js
+       picks them up. script.js is a module so it can import from decode.js. -->
   <script src="unishox2.js"></script>
   <script src="script.js"></script>
 
