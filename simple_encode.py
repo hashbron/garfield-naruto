@@ -147,7 +147,7 @@ def _letter_order(key, pos: int) -> list[int]:
     """Keyed order in which the 26 letters claim their roles.
 
     Uses SHA-256 alone — no numpy RNG — so JavaScript can derive the identical
-    order (see stego_decode.js). numpy's PCG64 is not reasonably reproducible
+    order (see the decoder in script.js). numpy's PCG64 is not reasonably reproducible
     outside numpy, which would have made the browser decoder a re-implementation
     of a library internal rather than of a specification.
 
