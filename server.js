@@ -17,7 +17,7 @@ const PORT = 3000;
 // ---------------------------------------------------------------------
 
 // The folder to run the script in.
-const WORKING_DIRECTORY = // SET WORKING DIRECTORY
+const WORKING_DIRECTORY = '/Users/harrisonbronfeld/Documents/CPR/';
 
 // The script + fixed args (topic/bits are appended safely below —
 // never edit this to build a command string with string concatenation).
@@ -71,12 +71,13 @@ const server = http.createServer((req, res) => {
     const topic = '"' + query.topic + '"' || '';
     const bitstream = '"' + query.bitstream + '"' || '';
     const key = query.key || '';
+    const attempts = query.attempts || 6;
 
     // Each element of this array is passed to the program as a single,
     // literal argument — NOT interpreted by a shell. So even if topic
     // contains quotes, semicolons, "&&", etc., it's just treated as text,
     // not executed. This is why there's no `shell: true` here.
-    const args = [SCRIPT, '--topic', topic, '--message', bitstream, '--key',  key, '--attempts', 6, '--clean'];
+    const args = [SCRIPT, '--topic', topic, '--message', bitstream, '--key',  key, '--attempts', attempts, '--clean'];
 
     const sendEvent = (line) => {
       // SSE format: each message is "data: <text>\n\n"
