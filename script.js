@@ -249,12 +249,15 @@ const decodeBtn = document.getElementById('decodeBtn');
 const decodeOutput = document.getElementById('decodeOutput');
 
 let eventSource = null;
-
 let first_line = true;
+let next_line = null;
 
 function appendLine(line) {
   if (first_line) {
     first_line = false;
+  }
+  else if (line.startsWith("[process exited")) {
+
   }
   else {
     output.textContent += line;
