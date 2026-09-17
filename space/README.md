@@ -9,8 +9,6 @@ app_file: app.py
 pinned: false
 license: mit
 short_description: Hide a short message inside LLM-generated cover text.
-hf_oauth: true
-hf_oauth_expiration_minutes: 480
 ---
 
 # Garfield-Naruto Encoder
@@ -27,17 +25,23 @@ runs entirely in the Space process and costs no GPU quota.
 This Space runs on **ZeroGPU**, where GPU time is charged to **the visitor's own
 account**, not to whoever published the Space. Quota is per user, per day.
 
-Sign in with the button on the Encode tab. Signing in matters:
-
 | | daily ZeroGPU quota |
 |---|---|
-| not signed in | ~2 minutes (tracked by IP) |
+| not identified | ~2 minutes, tracked by IP and shared |
 | free account | ~5 minutes |
 | PRO / Team / Enterprise | 40+ minutes, and pay-as-you-go credits past that |
 
-Without signing in you fall back to the anonymous IP-based pool, which is small
-and shared. PRO users who exhaust their daily quota continue against their own
-pre-paid credits.
+**There is no sign-in button, and you do not need one.** ZeroGPU identifies you
+from the `x-ip-token` header that the Hugging Face proxy injects using your
+huggingface.co session, so simply opening this Space in a browser where you are
+signed in is what puts the time on your own account. An app-level OAuth button
+(`gr.LoginButton` / `hf_oauth`) is a separate mechanism that tells the *app* who
+you are without changing your quota, so one here would only be misleading.
+
+Two situations fall back to the shared IP pool: not being signed in to
+huggingface.co, and running this Space **embedded in a frame on another site** —
+browsers restrict cookies in cross-site frames, so the proxy cannot see your
+session. Open the Space directly to avoid both.
 
 ## Warning
 

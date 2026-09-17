@@ -1,8 +1,8 @@
 # ZeroGPU supplies torch; pinning torch here can conflict with the runtime image.
-# gradio[oauth] is required for gr.LoginButton — sdk_version alone does NOT pull
-# in the OAuth extras, and the Space fails at import without it. Pinned to match
-# sdk_version in README.md so the extras cannot drag in a different gradio.
-gradio[oauth]==6.27.0
+# No OAuth extras: the Space has no sign-in button, because ZeroGPU attributes
+# quota from the visitor's huggingface.co session, not from app-level OAuth.
+# Pinned to match sdk_version in README.md.
+gradio==6.27.0
 transformers>=4.45
 accelerate
 numpy

@@ -1,10 +1,14 @@
 """Garfield-Naruto encoder as a ZeroGPU Space.
 
 ZeroGPU bills GPU time to the *visitor's* account rather than to whoever
-published the Space, and quota is per user per day. Signing in matters: an
-anonymous visitor falls back to a small IP-tracked pool, while a signed-in PRO
-user gets their own large quota and can spill into their own pre-paid credits.
-That is what `hf_oauth: true` in README.md and the login button below are for.
+published the Space, and quota is per user per day.
+
+There is deliberately no sign-in button. ZeroGPU identifies a visitor from the
+`x-ip-token` header the Hugging Face proxy injects using their huggingface.co
+session, so quota already follows whoever opens the Space. An app-level OAuth
+button (`gr.LoginButton` / `hf_oauth`) is a different mechanism: it would tell
+*this app* who the user is without changing their quota at all. Having one
+implied otherwise, so it was removed.
 
 Encoding needs the model, so it runs inside @spaces.GPU. Decoding needs only the
 text and the key, so it stays outside and costs no quota at all.
@@ -36,10 +40,6 @@ MAX_MESSAGE_CHARS = int(os.environ.get("STEGO_MAX_CHARS", "160"))
 # sentence_encode's default rather than surfaced as a control.
 TEMPERATURE = float(os.environ.get("STEGO_TEMPERATURE", "0.9"))
 
-# gradio mocks the OAuth routes off-Space and then refuses to build unless the
-# local machine is logged in to HF, so the login button is only mounted when
-# actually running in a Space. This keeps `python app.py` usable for local work.
-IN_SPACE = bool(os.environ.get("SPACE_ID"))
 
 # ZeroGPU wants the model on cuda at module level: a CUDA emulation layer is
 # active outside @spaces.GPU, and placements made at startup are far cheaper
@@ -162,14 +162,6 @@ def decode(text, key):
         return f"Could not decode: {exc}\n\n(Wrong key, or the cover text was edited.)"
 
 
-def whoami(profile: gr.OAuthProfile | None) -> str:
-    if profile is None:
-        return ("**Not signed in.** GPU time will come from the small anonymous "
-                "pool shared by IP. Sign in to use your own quota.")
-    return (f"Signed in as **{profile.username}** — GPU time is billed to your "
-            f"own ZeroGPU quota, not to the Space owner.")
-
-
 CSS = """
 #gn-out, #gn-decode-out textarea { font-family: ui-monospace, Menlo, Consolas, monospace; }
 """
@@ -198,13 +190,6 @@ with gr.Blocks(title="Garfield-Naruto Encoder") as demo:
         attempts = gr.Number(label="Attempts", value=6, minimum=1, maximum=10,
                              precision=0)
         go = gr.Button("Begin Encoding", variant="primary")
-
-        if IN_SPACE:
-            gr.LoginButton()
-            who = gr.Markdown()
-            demo.load(whoami, inputs=None, outputs=who)
-        else:
-            gr.Markdown("_Sign-in button appears when running on a Space._")
 
         out = gr.Textbox(label="Output", elem_id="gn-out", lines=10,
                          placeholder="Output will appear here…")
@@ -244,8 +229,9 @@ with gr.Blocks(title="Garfield-Naruto Encoder") as demo:
         gr.Markdown(
             f"Model: `{MODEL_ID}` · GPU time on ZeroGPU is charged to the "
             "**visitor**, per account per day — not to the account hosting this "
-            "Space. Sign in on the Encode tab to use your own quota instead of "
-            "the shared anonymous pool."
+            "Space. You are identified by your huggingface.co session, so open "
+            "this Space in a browser where you are signed in to use your own "
+            "quota rather than the pool shared by IP address."
         )
 
 if __name__ == "__main__":

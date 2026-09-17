@@ -26,12 +26,14 @@
     <div class="callout">
       <p>Encoding runs on a Hugging&nbsp;Face Space, because it needs the language
       model. <strong>The GPU time is billed to whoever runs it, not to us.</strong></p>
-      <p>Browsers block cookies inside a cross-site frame, so signing in <em>here</em>
-      will not stick. To use your own quota —&nbsp;5&nbsp;min/day on a free account,
+      <p>Hugging&nbsp;Face works out whose quota to use from your
+      huggingface.co session. Browsers restrict cookies inside a cross-site
+      frame, so in the box below it cannot see that session and falls back to a
+      small pool shared by IP address —&nbsp;which may report that you are out of
+      quota. To use your own allowance —&nbsp;5&nbsp;min/day on a free account,
       40&nbsp;min on PRO —&nbsp;<a href="https://huggingface.co/spaces/infiniteviolets/gn-encoder"
-      target="_blank" rel="noopener">open the encoder in a new tab</a> and sign in
-      there. Used below without signing in, it draws on a small pool shared by IP
-      address, so it may say you are out of quota.</p>
+      target="_blank" rel="noopener">open the encoder in a new tab</a>, signed in
+      to Hugging&nbsp;Face.</p>
     </div>
 
     <iframe class="space-embed"
