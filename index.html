@@ -42,6 +42,24 @@
             frameborder="0"
             allow="clipboard-write"></iframe>
 
+    <div id="localEncode" hidden>
+      <h3>Run it locally instead</h3>
+      <p class="status">The local helper (<code>server.js</code>) is running, so
+      you can encode on this machine with your own model rather than the hosted
+      one. This block stays hidden when the helper is not reachable, which is why
+      the deployed site never shows it.</p>
+      <p class="input_label">Message:<input type="text" size=75 placeholder="Enter your secret message here." id="fbitstream" name="Bitstream"><br></p>
+      <p class="input_label">Topic: <input type="text" size=50 placeholder="Choose a topic for the LLM slop." id="ftopic" name="Topic"><br></p>
+      <p class="input_label">Key:<input type="text" placeholder="Pick a secret key." id="fencodekey" name="Key"><br></p>
+      <p class="input_label">Attempts<input type="number" id="fattempts" value="6" name="Attempts" min="1" max="10"></p>
+      <div class="button_holder">
+        <button id="startBtn">Begin Encoding</button>
+        <button id="stopBtn" disabled>Stop</button>
+      </div>
+      <p class="status" id="statusText"></p>
+      <pre id="output">Output will stream here…</pre>
+    </div>
+
     <h2 id="decode_section">Decode a message</h2>
 
       <p class="input_label">Encoded text:<input type="text" size=75 placeholder="Paste the encoded text here." id="fencoded" name="Encoded"><br></p>

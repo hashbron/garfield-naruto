@@ -42,9 +42,25 @@ Hide a raw bitstream, printing only the cover text:
 
 ## Website
 
-The page is two halves. **Decoding is pure JavaScript** and works with no server at all — open `index.html`, paste cover text and the key, press DECODE. **Encoding** needs a local helper that runs the Python for you, because the model cannot run in the browser.
+The page works three ways, and needs no build step.
 
-Start the helper, pointing it at the interpreter that has `mlx-lm` installed:
+**Decoding is pure JavaScript.** It walks the characters with the key and never
+touches the model, so it works with no server and no GPU — open `index.html`,
+paste cover text and the key, press DECODE.
+
+**Encoding is embedded from a Hugging Face Space**, because it needs the model.
+GPU time is billed to whoever runs it. Note that browsers restrict cookies in a
+cross-site frame, so Hugging Face cannot see a visitor's session there and falls
+back to a small pool shared by IP address; opening the Space in its own tab,
+signed in, uses their own quota instead.
+
+That makes the page deployable as a **static site** — `index.html`, `style.css`,
+`script.js` and `unishox2.js`, on any static host.
+
+**Encoding locally is still available** when you want your own model rather than
+the hosted one. Start the helper and the page reveals a local encode block; it
+stays hidden otherwise, which is why the deployed site never shows it. Point it
+at the interpreter that has `mlx-lm` installed:
 
 ```
 PYTHON=~/.venvs/stego/bin/python node server.js
@@ -52,9 +68,13 @@ PYTHON=~/.venvs/stego/bin/python node server.js
 
 It listens on `http://localhost:3000` and runs `sentence_encode.py` in the directory `server.js` lives in. A bare `node server.js` uses whatever `python3` is on your PATH, which is usually the system Python and will fail with `ModuleNotFoundError: No module named 'numpy'`.
 
-Then open `index.html` in a browser — as a local file, no web server needed. Fill in Message, Topic and Key and press **Begin Encoding**; output streams in live over Server-Sent Events, and **Stop** kills the running process.
+Then open `index.html`. Fill in Message, Topic and Key under "Run it locally
+instead" and press **Begin Encoding**; output streams in live over Server-Sent
+Events, and **Stop** kills the running process.
 
-The server exposes only `/stream-command` and `/stop-command`. It does not serve the page itself, which is why `script.js` is a classic script rather than an ES module: browsers block module loading over `file://`.
+The server exposes only `/stream-command` and `/stop-command`. It does not serve
+the page itself, which is why `script.js` is a classic script rather than an ES
+module: browsers block module loading over `file://`.
 
 ## Tests
 

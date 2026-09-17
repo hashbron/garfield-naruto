@@ -273,10 +273,21 @@ function stopStream() {
   statusText.textContent = 'Stopped.';
 }
 
-// The encode controls only exist when the page is served alongside the local
-// helper server. On the static site they are replaced by an embedded Space, so
-// this whole block is skipped — without the guard the missing startBtn throws
-// here and the decode handler below never gets registered.
+// The local-encode block is hidden unless server.js answers, so the deployed
+// static site never shows it. Probing costs one request that is allowed to fail:
+// any response at all, 404 included, means the helper is there.
+const localEncode = document.getElementById('localEncode');
+if (localEncode) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 1500);
+  fetch('http://localhost:3000/', { signal: ac.signal })
+    .then(() => { localEncode.hidden = false; })
+    .catch(() => { /* no helper: the hosted encoder above is the only path */ })
+    .finally(() => clearTimeout(timer));
+}
+
+// Guarded because the controls live in that optional block: without this the
+// missing startBtn throws here and the decode handler below is never registered.
 if (startBtn && stopBtn) {
   startBtn.addEventListener('click', () => {
     output.textContent = '';
