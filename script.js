@@ -273,53 +273,59 @@ function stopStream() {
   statusText.textContent = 'Stopped.';
 }
 
-startBtn.addEventListener('click', () => {
-  output.textContent = '';
-  statusText.textContent = 'Connecting…';
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
+// The encode controls only exist when the page is served alongside the local
+// helper server. On the static site they are replaced by an embedded Space, so
+// this whole block is skipped — without the guard the missing startBtn throws
+// here and the decode handler below never gets registered.
+if (startBtn && stopBtn) {
+  startBtn.addEventListener('click', () => {
+    output.textContent = '';
+    statusText.textContent = 'Connecting…';
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
 
-  // Read the two input fields.
-  const topic = document.getElementById('ftopic').value;
-  const bitstream = document.getElementById('fbitstream').value;
-  const key = document.getElementById('fencodekey').value;
+    // Read the two input fields.
+    const topic = document.getElementById('ftopic').value;
+    const bitstream = document.getElementById('fbitstream').value;
+    const key = document.getElementById('fencodekey').value;
 
-  // Send them as query parameters. encodeURIComponent keeps special
-  // characters (spaces, &, etc.) from breaking the URL. This is safe:
-  // the server treats them as plain string data, never as shell
-  // commands, so there's nothing to inject here.
-  const params = new URLSearchParams({ topic, bitstream, key });
+    // Send them as query parameters. encodeURIComponent keeps special
+    // characters (spaces, &, etc.) from breaking the URL. This is safe:
+    // the server treats them as plain string data, never as shell
+    // commands, so there's nothing to inject here.
+    const params = new URLSearchParams({ topic, bitstream, key });
 
-  // EventSource opens a persistent connection and fires onmessage
-  // every time the server sends a new "data: ..." event.
-  eventSource = new EventSource(
-    `http://localhost:3000/stream-command?${params.toString()}`
-  );
+    // EventSource opens a persistent connection and fires onmessage
+    // every time the server sends a new "data: ..." event.
+    eventSource = new EventSource(
+      `http://localhost:3000/stream-command?${params.toString()}`
+    );
 
-  eventSource.onopen = () => {
-    statusText.textContent = 'Streaming…';
-  };
+    eventSource.onopen = () => {
+      statusText.textContent = 'Streaming…';
+    };
 
-  eventSource.onmessage = (event) => {
-    appendLine(event.data);
-  };
+    eventSource.onmessage = (event) => {
+      appendLine(event.data);
+    };
 
-  eventSource.onerror = () => {
-    statusText.textContent =
-      'Connection closed or lost (is server.js running?).';
+    eventSource.onerror = () => {
+      statusText.textContent =
+        'Connection closed or lost (is server.js running?).';
+      stopStream();
+    };
+  });
+
+  stopBtn.addEventListener('click', async () => {
+    // Tell the server to kill the running process, then close our connection.
+    try {
+      await fetch('http://localhost:3000/stop-command');
+    } catch (err) {
+      // Server may already be down; ignore.
+    }
     stopStream();
-  };
-});
-
-stopBtn.addEventListener('click', async () => {
-  // Tell the server to kill the running process, then close our connection.
-  try {
-    await fetch('http://localhost:3000/stop-command');
-  } catch (err) {
-    // Server may already be down; ignore.
-  }
-  stopStream();
-});
+  });
+}
 
 decodeBtn.addEventListener('click', () => {
   // Decoding runs entirely in the browser — no server needed.
