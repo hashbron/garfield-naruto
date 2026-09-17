@@ -249,12 +249,15 @@ const decodeBtn = document.getElementById('decodeBtn');
 const decodeOutput = document.getElementById('decodeOutput');
 
 let eventSource = null;
-
 let first_line = true;
+let next_line = null;
 
 function appendLine(line) {
   if (first_line) {
     first_line = false;
+  }
+  else if (line.startsWith("[process exited")) {
+
   }
   else {
     output.textContent += line;
@@ -299,12 +302,16 @@ if (startBtn && stopBtn) {
     const topic = document.getElementById('ftopic').value;
     const bitstream = document.getElementById('fbitstream').value;
     const key = document.getElementById('fencodekey').value;
+    // server.js reads this and passes it to --attempts; without sending it the
+    // server's `query.attempts || 6` always took the fallback and the Attempts
+    // field on the page did nothing.
+    const attempts = document.getElementById('fattempts').value || 6;
 
     // Send them as query parameters. encodeURIComponent keeps special
     // characters (spaces, &, etc.) from breaking the URL. This is safe:
     // the server treats them as plain string data, never as shell
     // commands, so there's nothing to inject here.
-    const params = new URLSearchParams({ topic, bitstream, key });
+    const params = new URLSearchParams({ topic, bitstream, key, attempts });
 
     // EventSource opens a persistent connection and fires onmessage
     // every time the server sends a new "data: ..." event.

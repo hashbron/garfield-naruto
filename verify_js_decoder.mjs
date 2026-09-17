@@ -377,9 +377,14 @@ function loadBrowserScripts() {
                       addEventListener(_, h) { this._h = h; },
                       click() { if (this._h) this._h(); },
                       scrollTop: 0, scrollHeight: 0 });
-  const ctx = { TextEncoder, console,
+  // Browser globals the page legitimately uses. script.js probes for the local
+  // helper on load, so without AbortController/timers the whole file throws here
+  // and none of the decoder is reachable. fetch rejects on purpose: that models
+  // the deployed static site, where no helper is listening.
+  const ctx = { TextEncoder, console, AbortController, setTimeout, clearTimeout,
                 document: { getElementById: (id) => (els[id] ??= mk()) },
-                EventSource: function () {}, fetch: () => Promise.resolve() };
+                EventSource: function () {},
+                fetch: () => Promise.reject(new Error("no local helper")) };
   ctx.window = ctx;
   vm.createContext(ctx);
   for (const f of ["unishox2.js", "script.js"]) {
