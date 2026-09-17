@@ -16,12 +16,19 @@ const PORT = 3000;
 // EDIT THESE for your setup.
 // ---------------------------------------------------------------------
 
-// The folder to run the script in.
-const WORKING_DIRECTORY = // SET WORKING DIRECTORY
+// The folder to run the script in. Defaults to wherever server.js lives, which
+// is the repo root, so this works unedited. Point it elsewhere if you keep the
+// Python somewhere other than next to this file.
+const WORKING_DIRECTORY = __dirname;
 
 // The script + fixed args (topic/bits are appended safely below —
 // never edit this to build a command string with string concatenation).
 const SCRIPT = 'sentence_encode.py';
+
+// Interpreter used to run SCRIPT. `python3` on PATH is often the system Python,
+// which has neither mlx-lm nor numpy, so point PYTHON at your virtualenv:
+//   PYTHON=~/.venvs/stego/bin/python node server.js
+const PYTHON = process.env.PYTHON || 'python3';
 
 // Track at most one running process at a time.
 let currentProcess = null;
@@ -68,8 +75,12 @@ const server = http.createServer((req, res) => {
 
     // Read the inputs sent from the page. These are just strings — never
     // built into a shell command, so there's nothing for anyone to inject.
-    const topic = '"' + query.topic + '"' || '';
-    const bitstream = '"' + query.bitstream + '"' || '';
+    // No quoting here on purpose. These are passed to spawn() as separate
+    // array elements, so each arrives as one literal argument; adding quotes
+    // would make them part of the text and encode a leading/trailing '"' into
+    // the payload.
+    const topic = query.topic || '';
+    const bitstream = query.bitstream || '';
     const key = query.key || '';
 
     // Each element of this array is passed to the program as a single,
@@ -83,9 +94,9 @@ const server = http.createServer((req, res) => {
       res.write(`data: ${line}\n\n`);
     };
 
-    sendEvent(`[running: python3 ${args.join(' ')}]`);
+    sendEvent(`[running: ${PYTHON} ${args.join(' ')}]`);
 
-    const child = spawn('python3', args, {
+    const child = spawn(PYTHON, args, {
       cwd: WORKING_DIRECTORY,
       // no shell: true — args are passed directly to python3, not through
       // a shell, so nothing in topic/bitstream can be interpreted as
@@ -143,5 +154,5 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`Local command server running at http://localhost:${PORT}`);
   console.log(`It will "cd" into: ${WORKING_DIRECTORY}`);
-  console.log(`Then run: python3 ${SCRIPT} --topic <topic> --message <bitstream> --key <key> --clean`);
+  console.log(`Then run: ${PYTHON} ${SCRIPT} --topic <topic> --message <bitstream> --key <key> --clean`);
 });

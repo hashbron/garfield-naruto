@@ -1,5 +1,5 @@
 /* ==================================================================== *
- * Keyed stego decoder — mirrors simple_encode.py's extract().
+ * Keyed stego decoder — mirrors sentence_encode.py's extract().
  *
  * The key schedule uses nothing but SHA-256 so Python and JavaScript derive
  * byte-identical letter roles. Unishox2 decompression is NOT implemented here:
@@ -71,7 +71,7 @@ function sha256Bytes(bytes) {
 
 const utf8 = (s) => new TextEncoder().encode(s);
 
-/* ---- scheme constants — must match simple_encode.py exactly ---- */
+/* ---- scheme constants — must match sentence_encode.py exactly ---- */
 const BIT0 = 0, BIT1 = 1, SKIP = 2, SKIP_FREE = 3, FORBIDDEN = 4;
 const ALPHA = "abcdefghijklmnopqrstuvwxyz";
 const FREE_CHARS = new Set(

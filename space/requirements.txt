@@ -1,0 +1,9 @@
+# ZeroGPU supplies torch; pinning torch here can conflict with the runtime image.
+# gradio[oauth] is required for gr.LoginButton — sdk_version alone does NOT pull
+# in the OAuth extras, and the Space fails at import without it. Pinned to match
+# sdk_version in README.md so the extras cannot drag in a different gradio.
+gradio[oauth]==6.27.0
+transformers>=4.45
+accelerate
+numpy
+unishox2-py3
