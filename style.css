@@ -25,16 +25,45 @@
 
 * { box-sizing: border-box; }
 
+html {
+    scroll-behavior: smooth;
+    scroll-padding: 220px;
+}
+
+@font-face {
+    font-family: 'BlackOpsOne';
+    src: url('/fonts/Forega-Sport-DEMO-Regular.ttf.woff') format("woff");
+    /*font-weight: 100;*/
+    font-style: normal;
+    font-display: swap;
+  }
+
+  @font-face {
+  font-family: 'Forega-Sport-DEMO-Regular';
+    src:  url('fonts/Forega-Sport-DEMO-Regular.ttf.woff') format('woff'),
+    url('fonts/Forega-Sport-DEMO-Regular.ttf.svg#Forega-Sport-DEMO-Regular') format('svg'),
+    url('fonts/Forega-Sport-DEMO-Regular.ttf.eot'),
+    url('fonts/Forega-Sport-DEMO-Regular.eot?#iefix') format('embedded-opentype'); 
+    font-weight: normal;
+    font-style: normal;
+}
+
 body {
-  margin: 0;
+  /*margin: 0;*/
   background: var(--bg);
   color: var(--fg);
-  font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, sans-serif;
+  /*font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, sans-serif;*/
   -webkit-font-smoothing: antialiased;
+
+  font-family: system-ui, sans-serif;
+  /*color: #222;*/
+  color: black;
+  background-color: #ffd480;
+  margin: 0px;
 }
 
 /* ---- header ------------------------------------------------------------- */
-.fixed-top {
+/*.fixed-top {
   position: sticky; top: 0; z-index: 10;
   background: color-mix(in srgb, var(--bg) 92%, transparent);
   backdrop-filter: blur(8px);
@@ -54,29 +83,215 @@ body {
   font-size: 0.9rem; padding: 8px 12px;
   border-bottom: 2px solid transparent;
 }
-.selection:hover { color: var(--fg); border-bottom-color: var(--accent); }
+.selection:hover { color: var(--fg); border-bottom-color: var(--accent); }*/
 
 /* ---- layout ------------------------------------------------------------- */
+
+
+h1 {
+    color: black; 
+    /*#0f0;*/
+    font-family: 'Forega-Sport-DEMO-Regular';
+    font-size: 40pt;
+    text-align: center;
+}
+
+h2 {
+  color: black; 
+    /*#0f0;*/
+    font-family: "Forega-Sport-DEMO-Regular", system-ui;
+    font-size: 25pt;
+    text-align: center;
+
+}
+
+h3 {
+  color: black; 
+    /*#0f0;*/
+    font-family: "Forega-Sport-DEMO-Regular", system-ui;
+    font-size: 16pt;
+    text-align: center;
+
+}
+
 .content-column {
   max-width: 760px;
   margin: 0 auto;
   padding: 8px 20px 96px;
 }
-h2 {
+
+.fixed-top {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  z-index: 1000;
+  background-color: #ffd480;
+}
+
+  }
+  button {
+    font-family: "Forega-Sport-DEMO-Regular", system-ui;
+    padding: 10px 18px;
+    border-radius: 6px;
+    border: 1px solid #333;
+    background: #222;
+    color: white;
+    cursor: pointer;
+    margin-right: 10px;
+  }
+  button:hover:not(:disabled) { background: #444; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #stopBtn { 
+    background: #b00020; 
+    border-color: #b00020; 
+    font-family: "Forega-Sport-DEMO-Regular", system-ui;
+    font-size: 25px;
+  }
+  #startBtn {
+    font-family: "Forega-Sport-DEMO-Regular", system-ui;
+    font-size: 25px;
+  }
+  #stopBtn:hover:not(:disabled) { background: #d0002a; font-family: "Forega-Sport-DEMO-Regular", system-ui;}
+
+  #decodeBtn{ 
+    font-family: "Forega-Sport-DEMO-Regular", system-ui;
+    font-size: 25px;
+  }
+  pre {
+    border-color: white;
+    background: #111;
+    color: #0f0;
+    border-radius: 6px;
+    padding: 14px;
+    margin-top: 20px;
+    min-height: 200px;
+    max-height: 420px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    font-family: 'Courier New', monospace;
+  }
+  .status { 
+    /*color: #666; */
+    color: black;
+    font-size: 0.7rem; 
+    margin-top: 8px; }
+
+  .select-bar {
+    height: 60px;
+    background-color: black;
+    display: flex;
+    justify-content: center;
+  }
+
+  .content-column {
+    margin-top: 250px;
+    margin-left: 25vw;
+    max-width: 50vw;
+    /*padding: 0 20px;*/
+  }
+
+  .content-section {
+  }
+
+  .content-spacer {
+    min-height: 10vh;
+  }
+
+  .selection {
+    color: #0f0;
+    margin-left: 30px;
+    margin-right: 30px;
+    margin-top: 18px;
+    font-family: "Forega-Sport-DEMO-Regular", system-ui;
+    font-size: 16pt;
+    text-decoration: none;
+  }
+
+  .selection:hover {
+    color: white;
+}
+
+.input_label {
+  font-family: 'Forega-Sport-DEMO-Regular';
+}
+
+.button_holder {
+  justify-content: center;
+  align-content: center;
+  display: flex;
+}
+
+table {
+    border-collapse: collapse;
+    border: 1px solid black;
+}
+
+th,
+td {
+    border: 1px solid black;
+    padding: 6px 10px;
+    text-align: center;
+}
+
+.table_holder {
+  display: flex;
+  justify-content: center;
+}
+
+.partitions {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    font-family: Arial, sans-serif;
+}
+
+.group {
+    border: 1px solid black;
+    border-radius: 6px;
+    padding: 12px;
+    width: 180px;
+    text-align: center;
+}
+
+.group h3 {
+    margin-top: 0;
+    border-bottom: 1px solid black;
+    padding-bottom: 6px;
+}
+
+.group1 { background: #e8f5e9; }
+.group2 { background: #e3f2fd; }
+.group3 { background: #fff3e0; }
+
+.letters {
+    font-size: 1.5em;
+    font-weight: bold;
+    letter-spacing: 0.2em;
+    margin: 10px 0;
+}
+
+.prob {
+    font-size: 0.9em;
+    color: #444;
+}
+
+/*h2 {
   margin: 44px 0 8px;
   font-size: 1.15rem; letter-spacing: -0.01em;
   padding-top: 12px; border-top: 1px solid var(--rule);
-}
-h2:first-of-type { border-top: 0; }
+}*/
+/*h2:first-of-type { border-top: 0; }
 p { margin: 0 0 14px; }
 a { color: var(--accent); }
 code {
   font-family: var(--mono); font-size: 0.88em;
   background: var(--accent-soft); padding: 1px 5px; border-radius: 4px;
-}
-
+}*/
+/*/*/*
 /* ---- forms -------------------------------------------------------------- */
-.input_label {
+
+/*.input_label {
   display: flex; align-items: center; gap: 10px;
   margin: 0 0 10px;
   font-size: 0.9rem; color: var(--muted);
@@ -113,7 +328,7 @@ pre {
   font-family: var(--mono); font-size: 0.86rem; line-height: 1.6;
   white-space: pre-wrap; word-break: break-word;
   min-height: 3.5em;
-}
+}*/
 
 /* ---- embedded Space ----------------------------------------------------- */
 .space-embed {
@@ -132,7 +347,7 @@ pre {
 .callout p:last-child { margin-bottom: 0; }
 
 /* ---- letter frequency table --------------------------------------------- */
-.table_holder { overflow-x: auto; margin: 0 0 22px; }
+/*.table_holder { overflow-x: auto; margin: 0 0 22px; }
 table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
 th {
   text-align: left; font-weight: 600; color: var(--muted);
@@ -143,10 +358,10 @@ td {
   border-bottom: 1px solid var(--rule);
   font-family: var(--mono);
 }
-td:empty { border-bottom: 0; }
+td:empty { border-bottom: 0; }*/
 
 /* ---- the three keyed buckets -------------------------------------------- */
-.partitions {
+/*.partitions {
   display: grid; gap: 12px; margin: 0 0 22px;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
 }
@@ -169,3 +384,4 @@ td:empty { border-bottom: 0; }
   .input_label { flex-direction: column; align-items: stretch; gap: 5px; }
   .space-embed { height: 640px; }
 }
+*/*/*/
