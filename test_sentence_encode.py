@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Standalone logic test for simple_encode.py — no model / GPU needed.
+"""Standalone logic test for sentence_encode.py — no model / GPU needed.
 
-Stubs MLX + a mock tokenizer/model so the constraint, search, and cache logic can
-be checked in milliseconds. Run:  python test_simple_encode.py
+Stubs MLX + a mock tokenizer/model so the constraint, sentence loop and cache logic can
+be checked in milliseconds. Run:  python test_sentence_encode.py
 """
 import sys, types, numpy as np, random, io, contextlib
 
-# --- stub mlx / mlx_lm so simple_encode imports without Apple-Silicon deps ---
+# --- stub mlx / mlx_lm so sentence_encode imports without Apple-Silicon deps ---
 mxc = types.ModuleType("mlx.core")
 mxc.array = lambda x: np.asarray(x); mxc.float32 = np.float32; mxc.eval = lambda *a, **k: None
 sys.modules["mlx"] = types.ModuleType("mlx"); sys.modules["mlx.core"] = mxc
@@ -20,7 +20,7 @@ cmod.can_trim_prompt_cache = lambda cache: True
 sys.modules["mlx_lm.models"] = types.ModuleType("mlx_lm.models")
 sys.modules["mlx_lm.models.cache"] = cmod
 
-import simple_encode as s
+import sentence_encode as s
 
 def quiet(f, *a, **k):
     with contextlib.redirect_stdout(io.StringIO()):
@@ -82,9 +82,8 @@ def test_keyed_roundtrip():
     for t in range(40):
         bits = [random.Random(9000 + t).randint(0, 1) for _ in range(random.Random(t).randint(4, 10))]
         key = f"key-{t}"
-        txt = quiet(s.steer_generate, make_model(t), tok, [VOCAB.index("the")], bits,
-                    max_tokens=400, temperature=0.7, num_candidates=8, fluency_weight=3.0,
-                    rollout_depth=1, tail_chars=0, key=key, seed=t)
+        txt, _ = quiet(s.generate, make_model(t), tok, [VOCAB.index("the")], bits,
+                       key=key, attempts=3, temperature=0.7, seed=t)
         if s.extract(txt, key)[:len(bits)] != bits:
             fails += 1
         if s.extract(txt, key + "X")[:len(bits)] != bits:   # wrong key -> garbage (usually)
@@ -117,9 +116,8 @@ def test_roundtrip():
     fails = viol = 0; dens = []
     for t in range(120):
         bits = [random.Random(1000 + t).randint(0, 1) for _ in range(random.Random(t).randint(3, 10))]
-        txt = quiet(s.steer_generate, make_model(t), tok, [VOCAB.index("the")], bits,
-                    max_tokens=400, temperature=0.7, num_candidates=8, fluency_weight=3.0,
-                    bit_bonus=3.0, rollout_depth=1, seed=t)
+        txt, _ = quiet(s.generate, make_model(t), tok, [VOCAB.index("the")], bits,
+                       attempts=3, temperature=0.7, seed=t)
         if s.extract(txt)[:len(bits)] != bits: fails += 1
         if wrongbit(txt, bits): viol += 1
         dens.append(min(len(bits), len(s.extract(txt))) / max(len(txt), 1))
@@ -129,20 +127,32 @@ def test_roundtrip():
 
 
 def test_cache_neutral():
+    """The KV cache must hold exactly the committed text and nothing else.
+
+    A rejected sentence is rolled back with trim_prompt_cache; an accepted one is
+    left in place. Committing a candidate other than the accepted one would leave
+    a sentence in the cache that never appears in the output, so every later token
+    would be conditioned on text the reader never sees. This asserts it does not."""
     caches = []
-    orig = cmod.make_prompt_cache
-    cmod.make_prompt_cache = lambda model, *a, **k: (lambda c: (caches.append(c) or c))(orig(model))
-    bits = [1, 0, 1, 1, 0, 0, 1]
-    txt = quiet(s.steer_generate, make_model(5), tok, [VOCAB.index("the")], bits,
-                max_tokens=300, num_candidates=8, fluency_weight=3.0, rollout_depth=2, seed=5)
-    cmod.make_prompt_cache = orig
-    ok = tok.decode(caches[0][0].seq[1:]) == txt and s.extract(txt)[:len(bits)] == bits
-    print(f"(3) cache decodes to output exactly & encodes: {ok}")
+    # the cache is opened through the backend shim, so patch the live backend
+    b = s.backend()
+    orig = b.new_cache
+    b.new_cache = lambda model, *a, **k: (lambda c: (caches.append(c) or c))(orig(model))
+    ok = True
+    for t in range(12):
+        caches.clear()
+        bits = [random.Random(500 + t).randint(0, 1) for _ in range(random.Random(t).randint(4, 12))]
+        txt, _ = quiet(s.generate, make_model(t), tok, [VOCAB.index("the")], bits,
+                       attempts=4, temperature=0.8, seed=t)
+        ok &= tok.decode(caches[0][0].seq[1:]) == txt
+        ok &= s.extract(txt)[:len(bits)] == bits
+    b.new_cache = orig
+    print(f"(3) cache holds exactly the committed text, x12: {ok}")
     return ok
 
 
 if __name__ == "__main__":
-    print("bucket sample:", {c: s.char_bucket(c) for c in "the cat."})
+    print("role sample:", {c: s.char_role(c, 0, None) for c in "the cat."})
     results = [test_constrain_vs_oracle(), test_roundtrip(), test_cache_neutral(),
                test_keyed_roundtrip()]
     print("\nALL PASS" if all(results) else "\nFAILURES PRESENT")

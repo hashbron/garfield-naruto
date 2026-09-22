@@ -4,9 +4,19 @@ sentence_encode.py — steganographic encoding, one sentence at a time.
 
 Hides a bitstream in fluent cover text by constraining which characters the model
 may emit: at each character position a character either carries the next payload
-bit, or skips. The constraint machinery (keyed alphabet, vectorised whole-vocab
-masking, payload framing) lives in simple_encode.py; this file adds the control
-loop around it.
+bit, or skips. Characters split into roles:
+
+    role 0                -> alpha, encodes bit 0
+    role 1                -> alpha, encodes bit 1
+    role 2 (SKIP)         -> alpha, off-bucket: carries no bit, *penalized*
+    role 3 (SKIP_FREE)    -> non-alpha (space/punct/...): carries no bit, *free*
+    role 4 (FORBIDDEN)    -> control / combining / non-Latin: never emitted
+
+A key reshuffles which letters hold which role, per character position, so the
+same letter carries different bits at different places in the text. Decoding
+needs only the text and the key — never the model — which is why the browser
+decoder in script.js can be a faithful reimplementation of a specification
+rather than of a library internal.
 
 A sentence is the unit of acceptance. Generation runs to a terminator, the finished
 sentence is scored, and a bad one is rolled back — KV cache, token list and payload
@@ -26,20 +36,551 @@ Known limit: retries inherit the prefix, so a sentence-level loop cannot escape 
 bad *opening*. When the accept rate collapses (nothing accepted over many attempts)
 the sample is usually unsalvageable and is better restarted with another seed.
 
+    pip install mlx-lm
     python sentence_encode.py --topic "the sea" --message "meet at dawn" --key k
     python sentence_encode.py --topic "the sea" --bits 10110100 --key k --clean
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import os
 import sys
+import unicodedata
+from functools import lru_cache
 
-import simple_encode as se          # sets the backend-quieting env vars on import
+# Quiet the backends: huggingface_hub and transformers read these when they are
+# imported, which `mlx_lm` does below — so they must be set first.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")   # "Fetching N files" bars
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")     # tokenizer warnings
 
 import numpy as np
-import mlx.core as mx
-from mlx_lm import load
-from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+
+
+# --------------------------------------------------------------------------- #
+# model backend
+# --------------------------------------------------------------------------- #
+# Only five operations touch the inference engine: load, open a cache, run one
+# forward, read the logits as a numpy vector, and roll the cache back. Isolating
+# them here lets the same constraint machinery run on MLX (Apple Silicon, local)
+# and on PyTorch/CUDA (a Hugging Face Space) without a second copy of the encoder.
+# Imports are deferred so neither engine has to be installed for the other to work.
+
+class _MLXBackend:
+    name = "mlx"
+
+    def __init__(self):
+        import mlx.core as mx
+        from mlx_lm import load
+        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+        self._mx, self._load = mx, load
+        self._make, self._trim = make_prompt_cache, trim_prompt_cache
+
+    def load(self, model_id):
+        return self._load(model_id)
+
+    def new_cache(self, model):
+        return self._make(model)
+
+    def forward(self, model, ids, cache):
+        out = model(self._mx.array([list(ids)]), cache=cache)[:, -1, :]
+        self._mx.eval(out)
+        return out
+
+    def to_numpy(self, logits):
+        return np.array(logits.astype(self._mx.float32)).reshape(-1)
+
+    def trim(self, cache, n):
+        self._trim(cache, n)
+
+
+class _TorchBackend:
+    """transformers + DynamicCache. `crop(-n)` is the analogue of MLX's
+    trim_prompt_cache, and is what makes sentence-level rollback possible."""
+    name = "torch"
+
+    def __init__(self, device=None, dtype=None):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+        self._torch, self._DynamicCache = torch, DynamicCache
+        self._AM, self._AT = AutoModelForCausalLM, AutoTokenizer
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = dtype or (torch.bfloat16 if self.device == "cuda" else torch.float32)
+
+    def load(self, model_id):
+        tok = self._AT.from_pretrained(model_id)
+        model = self._AM.from_pretrained(model_id, dtype=self.dtype).to(self.device)
+        model.eval()
+        return model, tok
+
+    def new_cache(self, model):
+        cache = self._DynamicCache(config=model.config)
+        # Sliding-window and linear-attention layers drop past states as they go,
+        # so crop() raises unless recording is switched on first.
+        if hasattr(cache, "activate_past_recording"):
+            cache.activate_past_recording()
+        return cache
+
+    def forward(self, model, ids, cache):
+        t = self._torch
+        x = t.tensor([list(ids)], dtype=t.long, device=self.device)
+        with t.inference_mode():
+            return model(input_ids=x, past_key_values=cache, use_cache=True).logits[:, -1, :]
+
+    def to_numpy(self, logits):
+        return logits.float().cpu().numpy().reshape(-1)
+
+    def trim(self, cache, n):
+        cache.crop(-int(n))
+
+
+_BACKEND = None
+
+
+def backend():
+    """The active backend, chosen once. STEGO_BACKEND=torch|mlx overrides the
+    default, which prefers MLX and falls back to PyTorch."""
+    global _BACKEND
+    if _BACKEND is None:
+        want = os.environ.get("STEGO_BACKEND", "").lower()
+        if want == "torch":
+            _BACKEND = _TorchBackend()
+        elif want == "mlx":
+            _BACKEND = _MLXBackend()
+        else:
+            try:
+                _BACKEND = _MLXBackend()
+            except ImportError:
+                _BACKEND = _TorchBackend()
+    return _BACKEND
+
+
+def set_backend(b):
+    """Install a backend explicitly (a Space loads the model once at startup)."""
+    global _BACKEND
+    _BACKEND = b
+
+
+def torch_backend(device=None, dtype=None):
+    """Explicit PyTorch backend. A ZeroGPU Space pins device="cuda" at import
+    time, because ZeroGPU wants models placed on cuda at module level."""
+    return _TorchBackend(device, dtype)
+
+
+def mlx_backend():
+    return _MLXBackend()
+
+
+SKIP = 2                # penalized bit-less role (a letter assigned "skip" this position)
+SKIP_FREE = 3           # free bit-less role (whitelisted prose punctuation / whitespace)
+FORBIDDEN = 4           # non-whitelisted non-alpha (control / combining / exotic): -inf, never emitted
+BIT_BUCKETS = (0, 1)    # roles that actually carry a bit
+
+# Tokens longer than this are marked junk and never emitted. The constraint matrix
+# is (vocab x longest token), so one 128-character token — the vocab's longest are
+# whitespace runs and '//------' rules — made 95% of that rectangle padding and
+# cost 22x the necessary work per step. Capping at 24 drops 0.4% of the vocab,
+# almost all of it formatting artefacts unwanted in prose anyway.
+MAX_TOKEN_CHARS = 24
+
+# `char_group` codes: 0-25 are the 26 letters (by index); the rest tag fixed,
+# non-shuffled characters.
+G_PUNCT = 26            # whitelisted punctuation  -> SKIP_FREE (fixed, free)
+G_NONLATIN = 27         # non-Latin letter         -> FORBIDDEN (never emitted)
+G_JUNK = 28             # control / combining / ... -> FORBIDDEN (never emitted)
+
+# Non-alpha characters that are FREE skips (natural in ordinary prose). Everything
+# else non-alpha — control chars, combining marks, exotic Unicode, and formatting
+# punctuation — is a *penalized* skip instead, closing the free-escape-hatch that
+# let generation spiral into junk Unicode: \n \t * | \ / _ and friends are all
+# forbidden rather than free.
+FREE_CHARS = frozenset(
+    " .,;:!?'\"()-"                                  # space + common ASCII sentence punctuation
+    "0123456789"                                     # digits appear in normal prose
+    "‘’“”–—…"     # curly quotes, en/em dash, ellipsis
+)
+
+# Relative English letter frequencies (letters only), used once at import time to
+# greedily split the alphabet into three near-equiprobable buckets (0, 1, SKIP).
+_FREQ = {
+    "e": 12.70, "t": 9.06, "a": 8.17, "o": 7.51, "i": 6.97, "n": 6.75,
+    "s": 6.33, "h": 6.09, "r": 5.99, "d": 4.25, "l": 4.03, "c": 2.78,
+    "u": 2.76, "m": 2.41, "w": 2.36, "f": 2.23, "g": 2.02, "y": 1.97,
+    "p": 1.93, "b": 1.49, "v": 0.98, "k": 0.77, "j": 0.15, "x": 0.15,
+    "q": 0.10, "z": 0.07,
+}
+
+
+def _make_buckets(freq: dict[str, float], n: int = 3) -> dict[str, int]:
+    """Greedily assign each letter to the currently-lightest bucket, so all `n`
+    buckets end up with near-equal total frequency in natural text."""
+    sums = [0.0] * n
+    members: dict[str, int] = {}
+    for ch in sorted(freq, key=lambda c: (-freq[c], c)):
+        k = min(range(n), key=lambda k: sums[k])
+        sums[k] += freq[ch]
+        members[ch] = k
+    return members
+
+
+_BUCKET = _make_buckets(_FREQ)
+
+_ALPHA = "abcdefghijklmnopqrstuvwxyz"
+_LIDX = {c: i for i, c in enumerate(_ALPHA)}
+_LFREQ = np.array([_FREQ[c] for c in _ALPHA])               # frequency by letter index
+_BASE_ROLE = np.array([_BUCKET[c] for c in _ALPHA], dtype=np.int8)  # key=None assignment
+_BASE_ROLE.setflags(write=False)
+
+
+@contextlib.contextmanager
+def _muffled(active: bool):
+    """Send stdout/stderr to /dev/null while active, and yield the *real* stdout so
+    a caller can still write to it on purpose. That is what lets --clean stream the
+    cover text live while everything else stays suppressed."""
+    console = sys.stdout
+    if not active:
+        yield console
+        return
+    with open(os.devnull, "w") as null, \
+            contextlib.redirect_stdout(null), contextlib.redirect_stderr(null):
+        yield console
+
+
+def parse_bits(s: str) -> list[int]:
+    return [1 if c == "1" else 0 for c in s if c in "01"]
+
+
+# --------------------------------------------------------------------------- #
+# keyed alphabet / constraint
+# --------------------------------------------------------------------------- #
+
+
+def _letter_order(key, pos: int) -> list[int]:
+    """Keyed order in which the 26 letters claim their roles.
+
+    Uses SHA-256 alone — no numpy RNG — so JavaScript can derive the identical
+    order (see the decoder in script.js). numpy's PCG64 is not reasonably reproducible
+    outside numpy, which would have made the browser decoder a re-implementation
+    of a library internal rather than of a specification.
+
+    26 sort keys of 4 bytes each; ties broken by letter index so the order is
+    fully determined."""
+    stream = b"".join(hashlib.sha256(f"{key}|{pos}|{b}".encode()).digest()
+                      for b in range(4))
+    return [i for _, i in sorted(
+        (int.from_bytes(stream[i * 4:i * 4 + 4], "big"), i) for i in range(26))]
+
+
+@lru_cache(maxsize=1 << 18)
+def _letter_roles(key, pos: int) -> np.ndarray:
+    """Keyed assignment of all 26 letters to roles {bit0=0, bit1=1, SKIP=2} at
+    character position `pos`. This reshuffles *membership* every position (not just
+    relabels three fixed groups), so no fixed letter clustering survives — over
+    text each letter lands in each role about equally. A greedy pass in the keyed
+    order fills the currently lightest role, keeping each role ~1/3 of letter
+    frequency for fluency. key=None returns the fixed base assignment."""
+    if key is None:
+        return _BASE_ROLE
+    sums = [0.0, 0.0, 0.0]
+    role = np.empty(26, dtype=np.int8)
+    for L in _letter_order(key, pos):
+        r = int(np.argmin(sums))
+        role[L] = r
+        sums[r] += _LFREQ[L]
+    role.setflags(write=False)
+    return role
+
+
+def char_group(ch: str) -> int:
+    """Key-independent class of a character: 0-25 = letter index (shuffled per
+    position); G_PUNCT = whitelisted punctuation; G_NONLATIN = non-Latin letter;
+    G_JUNK = control/combining/exotic. The last two are never emitted."""
+    if not ch.isalpha():
+        return G_PUNCT if ch in FREE_CHARS else G_JUNK
+    c = ch.lower()
+    if c in _LIDX:
+        return _LIDX[c]
+    for base in unicodedata.normalize("NFKD", c):
+        if base in _LIDX:
+            return _LIDX[base]
+    return G_NONLATIN
+
+
+def char_role(ch: str, pos: int = 0, key=None) -> int:
+    """Bit-role of `ch` at character position `pos` under `key`: 0/1 encode a bit;
+    SKIP/SKIP_FREE carry none; FORBIDDEN is never emitted. Only the 26 letters are
+    shuffled by the key — punctuation is a free skip, and non-Latin letters and junk
+    are forbidden (they are always-legal characters, i.e. escape hatches)."""
+    g = char_group(ch)
+    if g in (G_JUNK, G_NONLATIN):
+        return FORBIDDEN
+    if g < 26:                                          # a letter
+        return int(_letter_roles(key, pos)[g])
+    return SKIP_FREE
+
+
+def extract(text: str, key=None) -> list[int]:
+    """Recover the hidden bitstream: at each character position apply the keyed
+    alphabet and keep the bit-carrying roles, dropping every flavor of skip."""
+    return [r for pos, ch in enumerate(text)
+            for r in (char_role(ch, pos, key),) if r in BIT_BUCKETS]
+
+
+def verify(text: str, bits: list[int], key=None) -> bool:
+    """Check the payload reads back out of `text` under `key`."""
+    got = extract(text, key)
+    ok = got[:len(bits)] == bits
+    print(f"\n[stego] recovered {min(len(got), len(bits))}/{len(bits)} payload bits"
+          f"{'' if len(got) <= len(bits) else f' (+{len(got) - len(bits)} free tail bits)'}")
+    if not ok:
+        for i, want in enumerate(bits):
+            if i >= len(got):
+                print(f"  bit {i:>4}  <missing>  want={want}  XX")
+            elif got[i] != want:
+                print(f"  bit {i:>4}  got={got[i]} want={want}  XX")
+    print(f"[stego] {'PASS' if ok else 'FAIL'} — all {len(bits)} bits encoded: {ok}")
+    return ok
+
+
+class Encoder:
+    """Vectorized keyed stride-1 constraint over the whole vocabulary.
+
+    Precomputes, per token, the `char_group` code (`CHR`) of each of its characters
+    (0-25 letter index, G_PUNCT, G_NONLATIN, or -1 padding) and a junk flag. At each
+    step `constrain` applies the secret key's per-character-position letter->role
+    map to get each character's live role, then (vectorized) forbids any token whose
+    bit-carrying characters would disagree with the upcoming payload and penalizes
+    skip characters. `key=None` reproduces the fixed unkeyed scheme."""
+
+    def __init__(self, tok, bits: list[int], skip_penalty: float, key=None,
+                 topk: int = 0):
+        self.tok = tok
+        self.bits = np.array(bits, dtype=np.int8)
+        self.nbits = len(bits)
+        self.bits_pad = np.append(self.bits, np.int8(-1))   # sentinel for out-of-range gathers
+        self.skip_penalty = skip_penalty
+        # Restrict the per-step constraint to the `topk` highest-logit tokens
+        # instead of the whole vocabulary. The constraint is (vocab x max_c)
+        # elementwise work, so this is the single cheapest speedup available.
+        # Measured on real generations: at topk=2048 the legal tokens inside the
+        # window still hold 99.3% of the post-mask probability mass (5th pct
+        # 96.9%), with a median of 406 legal tokens and no step ever starved.
+        # 0 disables it and uses the full vocabulary.
+        self.topk = int(topk)
+        self.key = key
+        self.tables = None
+
+    # Static per-tokenizer tables, shared across Encoder instances. Building them
+    # decodes every token in the vocabulary (~0.7 s for 128k) and the result
+    # depends only on the tokenizer — not on the key, the bits, or the payload —
+    # so a long-lived process (a Space serving requests) pays for it once instead
+    # of on every call. `junk` is deliberately excluded: callers mutate it to
+    # un-forbid EOS, so each Encoder gets its own copy.
+    _SHARED: dict = {}
+    _SHARED_FIELDS = ("CHR", "max_c", "_letter_at", "_clipped", "_fixed")
+
+    def _build(self, V: int):
+        ck = (id(self.tok), V)
+        hit = Encoder._SHARED.get(ck)
+        if hit is not None:
+            for k in Encoder._SHARED_FIELDS:
+                setattr(self, k, hit[k])
+            self.junk = hit["junk"].copy()
+            return
+        print(f"[stego] indexing {V} tokens (one-time)...")
+        self.junk = np.zeros(V, dtype=bool)
+        max_c = 1
+        rows = []
+        for i in range(V):
+            gs = [char_group(c) for c in self.tok.decode([i])]
+            if len(gs) > MAX_TOKEN_CHARS:      # never emitted, so truncating is safe
+                gs = gs[:MAX_TOKEN_CHARS]      # and keeps the whole matrix narrow
+                self.junk[i] = True
+            rows.append(gs)
+            # A FORBIDDEN *role* does not block a token by itself — only this mask
+            # does — so every never-emit class has to be collected here. Non-Latin
+            # letters (CJK/Greek/Cyrillic) were previously a penalized-but-always-
+            # legal SKIP, i.e. a guaranteed escape hatch that got used once pricing
+            # closed the space and punctuation ones.
+            self.junk[i] |= (G_JUNK in gs) or (G_NONLATIN in gs)
+            if len(gs) > max_c:
+                max_c = len(gs)
+        CHR = np.full((V, max_c), -1, dtype=np.int16)   # char_group code per char, -1 = padding
+        for i, gs in enumerate(rows):
+            if gs:
+                CHR[i, :len(gs)] = gs
+        self.CHR, self.max_c = CHR, max_c
+        # Static per-character facts, computed once instead of on every step: the
+        # comparisons below used to run over the full matrix each token.
+        self._letter_at = (CHR >= 0) & (CHR < 26)
+        self._clipped = np.clip(CHR, 0, 25)
+        self._fixed = np.where(CHR == G_PUNCT, np.int8(SKIP_FREE),
+                      np.where(CHR == -1, np.int8(-1), np.int8(FORBIDDEN)))
+        cached = {k: getattr(self, k) for k in Encoder._SHARED_FIELDS}
+        cached["junk"] = self.junk.copy()
+        Encoder._SHARED[ck] = cached
+
+    def _roles(self, char_pos: int, rows=None):
+        """Live role of each token character at the given char position, for all
+        tokens or just `rows` — shape (V, max_c) or (len(rows), max_c)."""
+        E = self.max_c
+        rmap = np.stack([_letter_roles(self.key, char_pos + k) for k in range(E)])   # (E, 26)
+        clipped = self._clipped if rows is None else self._clipped[rows]
+        gathered = rmap[np.arange(E)[None, :], clipped]              # letters -> bit0/bit1/SKIP
+        # Everything that is not a letter has a role fixed at build time, so one
+        # select against the precomputed table replaces four full-matrix compares.
+        letter_at = self._letter_at if rows is None else self._letter_at[rows]
+        fixed = self._fixed if rows is None else self._fixed[rows]
+        return np.where(letter_at, gathered, fixed)
+
+    def constrain(self, consumed: int, char_pos: int, vec: np.ndarray):
+        """Return (masked_logits, bits_encoded_per_token) at payload bit `consumed`
+        and character position `char_pos`. Wrong-bit and junk tokens -> -inf; each
+        skip character subtracts `skip_penalty`."""
+        rem = self.nbits - consumed
+        if rem <= 0:                                    # payload spent -> only junk forbidden
+            out = vec.copy()
+            out[self.junk] = -np.inf
+            return out, np.zeros(vec.shape[0], dtype=np.int32)
+        V = vec.shape[0]
+        rows = None
+        if self.topk and self.topk < V:
+            rows = np.argpartition(vec, -self.topk)[-self.topk:]
+
+        role = self._roles(char_pos, rows)              # (n, max_c) live roles
+        enc_mask = (role == 0) | (role == 1)            # bit-carrying characters
+        cum = np.cumsum(enc_mask, axis=1) - enc_mask    # payload-bit offset of each enc char
+        bit_pos = consumed + cum
+        within = enc_mask & (bit_pos < self.nbits)      # enc chars still inside the payload
+        target = self.bits_pad[np.clip(bit_pos, 0, self.nbits)]
+        junk = self.junk if rows is None else self.junk[rows]
+        bad = (within & (role != target)).any(axis=1) | junk
+        sub = (vec if rows is None else vec[rows]) \
+            - self.skip_penalty * (role == SKIP).sum(axis=1)
+        sub[bad] = -np.inf
+        sub_bits = within.sum(axis=1).astype(np.int32)
+        sub_bits[bad] = 0
+
+        if rows is None:
+            return sub, sub_bits
+        if not np.isfinite(sub).any():                  # window starved: redo on all
+            self_topk, self.topk = self.topk, 0
+            try:
+                return self.constrain(consumed, char_pos, vec)
+            finally:
+                self.topk = self_topk
+        out = np.full(V, -np.inf)
+        out[rows] = sub
+        bits_enc = np.zeros(V, dtype=np.int32)
+        bits_enc[rows] = sub_bits
+        return out, bits_enc
+
+
+# --------------------------------------------------------------------------- #
+# sampling / scoring helpers
+# --------------------------------------------------------------------------- #
+def _vec(logits) -> np.ndarray:
+    return backend().to_numpy(logits)
+
+
+def _logsumexp(v: np.ndarray) -> float:
+    finite = v[np.isfinite(v)]
+    if finite.size == 0:
+        return -np.inf
+    m = float(finite.max())
+    return m + float(np.log(np.exp(v - m).sum()))
+
+
+def _sample_logits(logits: np.ndarray, temp: float, rng, top_p: float = 1.0) -> int:
+    """Sample an index from `logits` (may contain -inf) at temperature `temp`,
+    restricted to the top-`top_p` nucleus."""
+    if temp <= 1e-6:
+        return int(np.argmax(logits))
+    z = logits / temp
+    z = z - _logsumexp(z)
+    p = np.exp(z)
+    p[~np.isfinite(logits)] = 0.0
+    s = p.sum()
+    if s <= 0:
+        return int(np.argmax(logits))
+    p = p / s
+    if top_p < 1.0:
+        order = np.argsort(p)[::-1]
+        cut = int(np.searchsorted(np.cumsum(p[order]), top_p)) + 1
+        keep = np.zeros_like(p, dtype=bool)
+        keep[order[:cut]] = True
+        p = np.where(keep, p, 0.0)
+        p /= p.sum()
+    return int(rng.choice(p.size, p=p))
+
+
+def _antirepeat(vec: np.ndarray, gen_ids: list[int], *, freq_penalty: float,
+                window: int, no_repeat_ngram: int) -> np.ndarray:
+    """Discourage degenerate repetition, in place on `vec` (finite entries only)."""
+    if freq_penalty > 0 and gen_ids:
+        from collections import Counter
+        for t, ct in Counter(gen_ids[-window:]).items():
+            if np.isfinite(vec[t]):
+                vec[t] -= freq_penalty * ct
+    n = no_repeat_ngram
+    if n and n >= 1 and len(gen_ids) >= n - 1:
+        prefix = tuple(gen_ids[-(n - 1):]) if n > 1 else ()
+        for i in range(len(gen_ids) - n + 1):
+            if tuple(gen_ids[i:i + n - 1]) == prefix:
+                t = gen_ids[i + n - 1]
+                if np.isfinite(vec[t]):
+                    vec[t] -= 20.0
+    return vec
+
+
+def encoding_summary(text: str, bits: list[int], key=None) -> float:
+    """Print encoding density: hidden bits per character of cover text."""
+    encoded = min(len(bits), len(extract(text, key)))
+    bpc = encoded / len(text) if text else 0.0
+    print(f"[stego] density: {encoded} bits / {len(text)} chars = {bpc:.4f} bits/char")
+    return bpc
+
+
+def build_prompt(tokenizer, topic: str, think: bool):
+    """Chat prompt for the cover text.
+
+    Thinking models (SmolLM3, Qwen3, ...) accept `enable_thinking`; leaving it off
+    stops the model emitting a <think> reasoning block, which would otherwise get
+    stego-encoded into the payload as garbage. Models whose tokenizer doesn't take
+    the argument fall back to the plain template unchanged."""
+    messages = [{"role": "user", "content": f"Write a short story about: {topic}"}]
+    try:
+        out = tokenizer.apply_chat_template(messages, add_generation_prompt=True,
+                                            enable_thinking=think)
+    except TypeError:
+        out = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    return _as_ids(out)
+
+
+def _as_ids(out) -> list[int]:
+    """Token ids from whatever apply_chat_template returned.
+
+    mlx_lm hands back a plain list of ids; transformers 5.x hands back a
+    BatchEncoding, and iterating that yields its *keys* (strings), which fails
+    far downstream with a confusing error rather than here."""
+    if hasattr(out, "input_ids"):
+        out = out.input_ids
+    elif isinstance(out, dict):
+        out = out["input_ids"]
+    if isinstance(out, str):
+        raise TypeError("chat template returned text, not token ids; "
+                        "call it with tokenize=True")
+    out = list(out)
+    if out and isinstance(out[0], (list, tuple)):     # batched -> take the row
+        out = list(out[0])
+    return [int(i) for i in out]
+
+
+# --------------------------------------------------------------------------- #
+# sentence-level control loop
+# --------------------------------------------------------------------------- #
+
 
 TERMINATORS = ".!?"
 DICT_PATH = "/usr/share/dict/words"
@@ -112,13 +653,26 @@ def payload_span(text: str, nbits: int, key) -> int | None:
     payload and dividing by the whole text roughly halves the apparent density."""
     n = 0
     for i, ch in enumerate(text):
-        if se.char_role(ch, i, key) in se.BIT_BUCKETS:
+        if char_role(ch, i, key) in BIT_BUCKETS:
             n += 1
             if n >= nbits:
                 return i + 1
     return None
 
 
+MIN_SENTENCE_TOKENS = 2   # a terminator may not be the entire sentence
+
+
+def _can_end(sent: str, n_tokens: int) -> bool:
+    """Whether `sent` is allowed to finish yet.
+
+    The terminator check runs immediately after the first sampled token, so
+    without this a sentence can be the single token "." — complete, zero shocks,
+    zero coined words, and therefore the *best*-scoring candidate of a round.
+    Committing one of those makes no progress and shreds the prose. Requiring a
+    couple of tokens and at least one letter costs nothing on real sentences and
+    removes the degenerate optimum."""
+    return n_tokens >= MIN_SENTENCE_TOKENS and any(c.isalpha() for c in sent)
 
 
 def _sentence_done(text: str) -> bool:
@@ -160,20 +714,20 @@ class Budget:
 
 def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
                    rng, temperature, top_p, bit_bonus, eos_ids, budget,
-                   skip_penalty, max_chars, allow_abort=True):
+                   max_chars, allow_abort=True):
     """Generate one sentence. Returns a dict describing it; the caller decides
     whether to keep it. Leaves the cache advanced by `n_tokens` either way."""
     new, excesses, cur, hit_eos, complete = [], [], consumed, False, False
     sent = ""
     while True:
-        raw = se._vec(logits)
-        lse = se._logsumexp(raw)
+        raw = _vec(logits)
+        lse = _logsumexp(raw)
         char_pos = len(tok.decode(tokens[offset:])) + len(sent)
         masked, bits_enc = enc.constrain(cur, char_pos, raw)
         if cur < enc.nbits:                    # never stop mid-payload
             for e in eos_ids:
                 masked[e] = -np.inf
-        base = se._antirepeat(masked.copy(), tokens[offset:] + new,
+        base = _antirepeat(masked.copy(), tokens[offset:] + new,
                               freq_penalty=0.5, window=64, no_repeat_ngram=3)
         base = base + bit_bonus * bits_enc
         if not np.isfinite(base).any():
@@ -186,7 +740,7 @@ def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
         # step toward the model's mode, which is the same axis the detectability
         # work is trying not to disturb. Quality control belongs at the sentence
         # level, where it can be judged and measured.
-        choice = se._sample_logits(base, temperature, rng, top_p)
+        choice = _sample_logits(base, temperature, rng, top_p)
         ex = (lse - float(raw[choice])) - H
         excesses.append(ex)
 
@@ -197,9 +751,7 @@ def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
         new.append(choice)
         sent += s
         cur += int(bits_enc[choice])
-        clog = model(mx.array([[choice]]), cache=cache)[:, -1, :]
-        mx.eval(clog)
-        logits = clog
+        logits = backend().forward(model, [choice], cache)
         # Early abort. Stop at the *budget*, not just at catastrophe: once the
         # sentence has already blown its shock allowance it cannot be accepted, so
         # every further token is paid for and then discarded.
@@ -209,7 +761,7 @@ def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
         # were committed mid-word ("sp" + "ikit" -> "spikit").
         if allow_abort and ex > budget.hard_abort:
             break                                  # aborted: `complete` stays False
-        if _sentence_done(sent) or len(sent) >= max_chars:
+        if (_sentence_done(sent) and _can_end(sent, len(new))) or len(sent) >= max_chars:
             complete = True
             break
 
@@ -230,24 +782,39 @@ def _grow_sentence(model, tok, enc, cache, logits, *, tokens, offset, consumed,
 _VOCAB: set[str] = set()
 
 
+def _eos_ids(tok) -> set[int]:
+    """End-of-text token ids, normalised across tokenizer flavours.
+
+    mlx_lm's wrapper exposes `eos_token_ids` as a collection; a plain
+    transformers tokenizer exposes it as a bare int (and some have only
+    `eos_token_id`). Feeding the int straight to set() raises TypeError, which is
+    the kind of difference that only shows up once the same code runs on a second
+    backend."""
+    out = set()
+    for attr in ("eos_token_ids", "eos_token_id"):
+        v = getattr(tok, attr, None)
+        if v is None:
+            continue
+        out |= {int(v)} if isinstance(v, int) else {int(x) for x in v}
+    return out
+
+
 def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
              top_p=0.95, bit_bonus=1.0, skip_penalty=1.0,
              max_sentence_chars=200, budget=None, seed=0, verbose=False,
-             stream_to=None):
+             stream_to=None, topk=0):
     """Encode `bits`, accepting one sentence at a time."""
     global _VOCAB
     if not _VOCAB:
         _VOCAB = load_vocab()
     budget = budget or Budget()
-    enc = se.Encoder(tok, bits, skip_penalty, key)
+    enc = Encoder(tok, bits, skip_penalty, key, topk=topk)
     rng = np.random.default_rng(seed)
-    eos_ids = set(getattr(tok, "eos_token_ids", None) or
-                  ([tok.eos_token_id] if getattr(tok, "eos_token_id", None) is not None else []))
+    eos_ids = _eos_ids(tok)
 
     tokens, offset = list(prompt), len(prompt)
-    cache = make_prompt_cache(model)
-    logits = model(mx.array(prompt)[None], cache=cache)[:, -1, :]
-    mx.eval(logits)
+    cache = backend().new_cache(model)
+    logits = backend().forward(model, prompt, cache)
     enc._build(logits.shape[1])
     for e in eos_ids:
         if e < enc.junk.size:
@@ -256,13 +823,13 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
     consumed = 0
     stats = {"accepted": 0, "rejected": 0, "fallback": 0}
     while consumed < enc.nbits:
-        best = None
+        best = accepted = None
         def attempt(allow_abort=True):
             return _grow_sentence(
                 model, tok, enc, cache, logits, tokens=tokens, offset=offset,
                 consumed=consumed, rng=rng, temperature=temperature, top_p=top_p,
                 bit_bonus=bit_bonus, eos_ids=eos_ids, budget=budget,
-                skip_penalty=skip_penalty, max_chars=max_sentence_chars,
+                max_chars=max_sentence_chars,
                 allow_abort=allow_abort)
 
         for _ in range(attempts):
@@ -279,11 +846,18 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
                 best = (key_, cand)
             if cand["ok"]:
                 stats["accepted"] += 1
+                accepted = cand
                 break
             stats["rejected"] += 1
             if cand["n"]:                       # roll the cache back and retry
-                trim_prompt_cache(cache, cand["n"])
-        cand = best[1]
+                backend().trim(cache, cand["n"])
+        # An accepted candidate is the one still in the cache: the loop breaks
+        # before trimming it. `best` ranks coined words ahead of shocks, so a
+        # *rejected* candidate can outrank an accepted one — taking it here would
+        # replay its tokens on top of the accepted ones, leaving the cache
+        # holding a sentence that never appears in the output and conditioning
+        # everything after it on text the reader never sees.
+        cand = accepted if accepted is not None else best[1]
         if not cand["ok"]:
             stats["fallback"] += 1
         if not cand["complete"]:
@@ -303,8 +877,7 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
             # generating afresh: sampling again would commit a *different* sentence
             # than the one just selected, making the whole comparison decorative.
             for t in cand["tokens"]:
-                clog = model(mx.array([[t]]), cache=cache)[:, -1, :]
-                mx.eval(clog)
+                clog = backend().forward(model, [t], cache)
             cand = dict(cand, logits=clog)
         if verbose:
             print(f"  [{'ok ' if cand['ok'] else 'FB '}] shocks={cand['shocks']} "
@@ -325,23 +898,22 @@ def generate(model, tok, prompt, bits, *, key=None, attempts=6, temperature=0.9,
 
 def _generate_and_verify(args, bits, codec, stream_to=None):
     """Generate and check the payload, printing progress. Mirrors the same helper
-    in simple_encode.py so both scripts behave identically under --clean: the
-    caller decides whether this output is shown, and the exit code still reports
-    verification either way."""
-    model, tok = load(args.model)
-    prompt = se.build_prompt(tok, args.topic, args.think)
+    Under --clean the caller decides whether this output is shown; the exit code
+    still reports verification either way."""
+    model, tok = backend().load(args.model)
+    prompt = build_prompt(tok, args.topic, args.think)
     text, stats = generate(
         model, tok, prompt, bits, key=args.key, attempts=args.attempts,
         temperature=args.temperature, bit_bonus=args.bit_bonus,
-        skip_penalty=args.skip_penalty,
+        skip_penalty=args.skip_penalty, topk=args.topk,
         seed=args.seed, verbose=True, stream_to=stream_to,
         budget=Budget(max_shocks=args.max_shocks, max_coined=args.max_coined,
                       max_caps=args.max_caps))
     if stream_to is None:               # streaming already showed it live
         print("\n" + "=" * 60)
         print(text.strip())
-    ok = se.verify(text, bits, args.key)
-    se.encoding_summary(text, bits, args.key)
+    ok = verify(text, bits, args.key)
+    encoding_summary(text, bits, args.key)
     span = payload_span(text, len(bits), args.key)
     if span:
         print(f"[stego] payload region: {len(bits) / span:.4f} bits/char "
@@ -349,7 +921,7 @@ def _generate_and_verify(args, bits, codec, stream_to=None):
     print(f"[stego] sentences: {stats['accepted']} accepted, "
           f"{stats['rejected']} rejected, {stats['fallback']} fallback")
     if codec is not None and ok:
-        recovered = codec.decompress_from_bits(se.extract(text, args.key))
+        recovered = codec.decompress_from_bits(extract(text, args.key))
         match = recovered == args.message
         print(f"[codec] recovered message: {recovered!r}")
         print(f"[codec] {'MATCH — message round-trips' if match else 'MISMATCH'}")
@@ -371,8 +943,13 @@ def main() -> None:
     ap.add_argument("--skip-penalty", type=float, default=1.0,
                     help="logit penalty per off-bucket-letter (SKIP) character")
     ap.add_argument("--bit-bonus", type=float, default=1.0,
-                    help="score reward per bit a candidate encodes (raises density "
-                         "vs fluency; 2.0 suppresses word breaks, see the sweep)")
+                    help="logit bonus per bit a token would encode, added before "
+                         "sampling (raises density at the cost of fluency)")
+    ap.add_argument("--topk", type=int, default=0,
+                    help="constrain only the N highest-logit tokens each step "
+                         "instead of the whole vocabulary. 2048 keeps 99.3%% of the "
+                         "post-mask probability mass and cuts the per-step "
+                         "constraint from ~33ms to ~2ms (0 = whole vocabulary)")
     ap.add_argument("--attempts", type=int, default=6,
                     help="regenerations allowed per sentence before taking the best")
     ap.add_argument("--max-shocks", type=int, default=1,
@@ -406,14 +983,14 @@ def main() -> None:
         if not args.clean:
             print(f"[codec] {codec.ratio_report(args.message, bits)}")
     else:
-        bits = se.parse_bits(args.bits)
+        bits = parse_bits(args.bits)
         if not bits:
             ap.error("--bits must contain at least one 0 or 1")
 
     # --clean streams each sentence to the real console as it is committed, and
     # muffles everything else. Sentences are the unit here: a rejected one is
     # regenerated, so nothing can be emitted until it has been accepted.
-    with se._muffled(args.clean) as console:
+    with _muffled(args.clean) as console:
         text, ok = _generate_and_verify(args, bits, codec,
                                         stream_to=console if args.clean else None)
     if args.clean:

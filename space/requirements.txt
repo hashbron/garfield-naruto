@@ -1,0 +1,9 @@
+# ZeroGPU supplies torch; pinning torch here can conflict with the runtime image.
+# No OAuth extras: the Space has no sign-in button, because ZeroGPU attributes
+# quota from the visitor's huggingface.co session, not from app-level OAuth.
+# Pinned to match sdk_version in README.md.
+gradio==6.27.0
+transformers>=4.45
+accelerate
+numpy
+unishox2-py3
