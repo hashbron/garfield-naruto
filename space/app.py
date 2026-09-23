@@ -196,44 +196,6 @@ with gr.Blocks(title="Garfield-Naruto Encoder") as demo:
         note = gr.Markdown()
         go.click(encode, [msg, topic, key_in, attempts], [out, note])
 
-    with gr.Tab("Decode"):
-        gr.Markdown("## Decode a message")
-        gr.Markdown("Decoding needs only the text and the key — no model and no "
-                    "GPU, so this tab costs no quota.")
-        dtext = gr.Textbox(label="Encoded text", lines=8,
-                           placeholder="Paste the encoded text here.")
-        dkey = gr.Textbox(label="Key", placeholder="Pick a secret key.",
-                          type="password")
-        dgo = gr.Button("DECODE", variant="primary")
-        dout = gr.Textbox(label="Decoded message", elem_id="gn-decode-out",
-                          lines=3,
-                          placeholder="Decoded message will appear here…")
-        dgo.click(decode, [dtext, dkey], dout)
-
-    with gr.Tab("How it works"):
-        gr.Markdown(
-            "Every character of the output is an encoding slot. Based on the key, "
-            "the alphabet is partitioned into three sets at **each character "
-            "position**: one encodes a `0`, one encodes a `1`, and one is a skip "
-            "that carries nothing. The partition is balanced by English letter "
-            "frequency so all three are roughly equally likely in natural text.\n\n"
-            "At every step the model's next-token distribution is masked to the "
-            "tokens whose characters agree with the bits still to be sent, then "
-            "sampled. A sentence is generated, scored, and regenerated if it reads "
-            "badly — so the payload survives while the prose stays readable.\n\n"
-            "Decoding reverses only the character step: walk the text, apply the "
-            "same keyed partition per position, and read off the bits. **No model "
-            "is involved**, which is why the Decode tab needs no GPU and why a "
-            "browser can do it."
-        )
-        gr.Markdown(
-            f"Model: `{MODEL_ID}` · GPU time on ZeroGPU is charged to the "
-            "**visitor**, per account per day — not to the account hosting this "
-            "Space. You are identified by your huggingface.co session, so open "
-            "this Space in a browser where you are signed in to use your own "
-            "quota rather than the pool shared by IP address."
-        )
-
 if __name__ == "__main__":
     # css moved from the Blocks constructor to launch() in Gradio 6
     demo.launch(css=CSS)
