@@ -89,7 +89,8 @@ const server = http.createServer((req, res) => {
     // literal argument — NOT interpreted by a shell. So even if topic
     // contains quotes, semicolons, "&&", etc., it's just treated as text,
     // not executed. This is why there's no `shell: true` here.
-    const args = [SCRIPT, '--topic', topic, '--message', bitstream, '--key',  key, '--attempts', attempts, '--clean'];
+    const args = [SCRIPT, '--topic', topic, '--message', bitstream, '--attempts', attempts, '--clean'];
+    if (key) args.push('--key', key);
 
     const sendEvent = (line) => {
       // SSE format: each message is "data: <text>\n\n"

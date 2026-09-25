@@ -228,10 +228,11 @@ function decodeMessage(text, key) {
     throw new Error("unishox2.js did not load, so the message cannot be decompressed");
   }
   const out = unishox2_decompress_simple(compressed, compressed.length);
-  if (out.length !== originalSize) {
+  const outBytes = new TextEncoder().encode(out).length;
+  if (outBytes !== originalSize) {
     throw new Error(
-      `unishox2 length mismatch: frame declares ${originalSize} chars, ` +
-      `decompressed ${out.length}`
+      `unishox2 length mismatch: frame declares ${originalSize} bytes, ` +
+      `decompressed ${outBytes}`
     );
   }
   return out;
