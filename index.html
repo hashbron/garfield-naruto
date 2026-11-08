@@ -61,7 +61,7 @@
     <pre id="decodeOutput">Decoded message will appear here…</pre>
 
     <h2 id="how_it_works_section">How it works</h2>
-    <p>The first step of our encoding takes the secret message, converts it to a bistring, and then compresses it using <a href="https://pypi.org/project/unishox2-py3/">unishox2.</a></p>
+    <p>The first step of our encoding takes the secret message, converts it to a bitstring, and then compresses it using <a href="https://pypi.org/project/unishox2-py3/">unishox2.</a></p>
 
     <p>From there, the secret message is encoded in the LLM text using the individual characters. Based on the key, we partition the set of all characters into three subsets. One set encodes a 0, another a 1, and the third encodes a skip. The partitioning is done using the frequency of different characters in English language text.</p>
     <div class="table_holder">
